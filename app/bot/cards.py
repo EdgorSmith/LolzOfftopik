@@ -11,7 +11,12 @@ from aiogram.utils.text_decorations import html_decoration as hd
 
 from app.bot.keyboards import replied_kb, thread_card_kb
 from app.db import Store
-from app.lolz import Thread, extract_media, render_text_for_telegram
+from app.lolz import (
+    Thread,
+    apply_emoji_map_to_escaped_html,
+    extract_media,
+    render_text_for_telegram,
+)
 
 log = logging.getLogger(__name__)
 
@@ -23,9 +28,9 @@ def _format_card_html(thread: Thread, *, for_caption: bool) -> str:
     text_body = render_text_for_telegram(
         thread.first_post_body_html, max_len=2800 if not for_caption else 800
     )
-    title = hd.bold(hd.quote(thread.title or "(без заголовка)"))
+    title = hd.bold(apply_emoji_map_to_escaped_html(hd.quote(thread.title or "(без заголовка)")))
     author = hd.italic(f"@{hd.quote(thread.creator_username)}")
-    body = hd.quote(text_body) if text_body else hd.italic("(пусто)")
+    body = apply_emoji_map_to_escaped_html(hd.quote(text_body)) if text_body else hd.italic("(пусто)")
     likes = thread.like_count
     likes_line = f"❤ {likes}" if likes else ""
     head = f"{title}\n{author}{(' · ' + likes_line) if likes_line else ''}"
