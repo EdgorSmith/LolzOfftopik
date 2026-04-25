@@ -113,6 +113,11 @@ class LolzClient:
         data = await self._request("GET", f"/threads/{thread_id}")
         return parse_thread(data.get("thread") or data)
 
+    async def get_post(self, post_id: int) -> dict:
+        """Fetch a single post (with embedded ``thread`` field)."""
+        data = await self._request("GET", f"/posts/{post_id}")
+        return data.get("post") or {}
+
     async def list_thread_posts(
         self,
         thread_id: int,
