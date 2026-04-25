@@ -173,6 +173,35 @@ class LolzClient:
         params = {"reason": reason} if reason else None
         await self._request("DELETE", f"/threads/{thread_id}", params=params)
 
+    # ----- user timeline (for stats) -------------------------------------------
+
+    async def list_user_timeline(
+        self,
+        user_id: int,
+        *,
+        forum_id: int | None = None,
+        page: int = 1,
+        limit: int = 50,
+    ) -> dict:
+        """Fetch one page of a user's timeline.
+
+        Returns the raw API response; the interesting fields are ``data`` (list
+        of mixed posts/threads), ``data_total`` and ``links`` (with ``pages``).
+        """
+        params: dict = {"page": page, "limit": limit}
+        if forum_id is not None:
+            params["forum_id"] = forum_id
+        return await self._request("GET", f"/users/{user_id}/timeline", params=params)
+
+    # ----- notifications -------------------------------------------------------
+
+    async def list_notifications(self, *, limit: int = 20, page: int = 1) -> dict:
+        """Fetch the authenticated user's notifications (alerts). Returns the
+        raw response with a ``notifications`` list."""
+        return await self._request(
+            "GET", "/notifications", params={"limit": limit, "page": page}
+        )
+
     # ----- users ---------------------------------------------------------------
 
     async def me(self) -> dict:

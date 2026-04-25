@@ -17,6 +17,7 @@ from app.file_proxy import add_routes as add_proxy_routes
 from app.health import build_app as build_http_app
 from app.health import run_http_server
 from app.lolz import LolzClient
+from app.notif_poller import NotifPoller
 from app.poller import Poller
 
 
@@ -53,6 +54,9 @@ async def amain() -> None:
     poller = Poller(config, store, lolz, bot)
     poller.start()
 
+    notif_poller = NotifPoller(config, store, lolz, bot)
+    notif_poller.start()
+
     http_app = build_http_app()
     add_proxy_routes(
         http_app,
@@ -82,6 +86,7 @@ async def amain() -> None:
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
         await poller.stop()
+        await notif_poller.stop()
         await lolz.close()
         await bot.session.close()
         await http_runner.cleanup()

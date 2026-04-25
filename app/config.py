@@ -27,6 +27,7 @@ class Config:
     lolz_offtop_forum_id: int
     lolz_offtop_url: str
     poll_interval_seconds: int
+    notif_poll_interval_seconds: int
     http_port: int
     db_path: str
     public_url: str  # e.g. "https://lolzofftopik.onrender.com" — used to host attachments for replies
@@ -47,6 +48,7 @@ class Config:
             lolz_offtop_forum_id=int(os.environ.get("LOLZ_OFFTOP_FORUM_ID", "8")),
             lolz_offtop_url=os.environ.get("LOLZ_OFFTOP_URL", "https://lolz.live/forums/8/"),
             poll_interval_seconds=int(os.environ.get("POLL_INTERVAL_SECONDS", "25")),
+            notif_poll_interval_seconds=int(os.environ.get("NOTIF_POLL_INTERVAL_SECONDS", "60")),
             http_port=int(os.environ.get("PORT", "10000")),
             db_path=os.environ.get("DB_PATH", "data/state.sqlite3"),
             public_url=public_url,

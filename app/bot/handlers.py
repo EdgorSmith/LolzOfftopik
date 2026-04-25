@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC
 
 from aiogram import Bot, F, Router
@@ -24,6 +25,7 @@ from app.bot.cards import (
 from app.bot.keyboards import (
     CREATE_THREAD_BUTTON_TEXT,
     START_BUTTON_TEXT,
+    STATS_BUTTON_TEXT,
     STOP_BUTTON_TEXT,
     cancel_kb,
     confirm_kb,
@@ -37,6 +39,10 @@ from app.lolz import LolzClient
 from app.lolz.client import LolzApiError
 
 log = logging.getLogger(__name__)
+
+# Hard cap on /users/{me}/timeline pages walked when computing stats.
+# 20 pages * 50 items * ~3.1s rate-limit ≈ 60 s upper bound on a cold call.
+_STATS_PAGE_LIMIT = 20
 
 
 def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
@@ -105,6 +111,9 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
         if text in (CREATE_THREAD_BUTTON_TEXT, "/new_thread"):
             await _begin_create_thread(message)
             return
+        if text in (STATS_BUTTON_TEXT, "/stats"):
+            await _send_stats(message)
+            return
 
         # Otherwise — show the menu.
         polling = await store.is_polling_enabled()
@@ -139,6 +148,106 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
     async def _stop_polling(message: Message) -> None:
         await store.set_polling_enabled(False)
         await message.answer("⏹ Оффтоп остановлен.", reply_markup=main_menu(False))
+
+    async def _send_stats(message: Message) -> None:
+        """Compute and send the user's offtop stats over 12h / 7d / all-time.
+
+        Walks through ``/users/{me}/timeline?forum_id=8`` page by page, summing
+        ``post_like_count`` (likes received) and counting posts. Stops early
+        once we've covered enough history for all three windows. Bounded at
+        ``_STATS_PAGE_LIMIT`` pages so a runaway account doesn't burn through
+        rate-limit.
+        """
+        if not store.self_user_id:
+            await message.answer("⚠ Профиль ещё не подгружен — попробуй через минуту.")
+            return
+        progress = await message.answer("📊 Считаю статистику... (~10–20 сек)")
+        try:
+            stats = await _compute_offtop_stats(store.self_user_id)
+        except LolzApiError as e:
+            log.exception("stats failed: %s", e)
+            await _safe_delete(message.bot, message.chat.id, progress.message_id)
+            await message.answer(f"⚠ Не удалось получить статистику: {e}")
+            return
+        text = (
+            f"📊 <b>Статистика в оффтопе</b>\n\n"
+            f"<b>Получено лайков</b>\n"
+            f"  • за 12 ч — {stats['likes_12h']}\n"
+            f"  • за 7 дней — {stats['likes_7d']}\n"
+            f"  • за всё время — {stats['likes_total']}\n\n"
+            f"<b>Сообщений</b>\n"
+            f"  • за 12 ч — {stats['posts_12h']}\n"
+            f"  • за 7 дней — {stats['posts_7d']}\n"
+            f"  • за всё время — {stats['posts_total']}"
+        )
+        if stats.get("truncated"):
+            from datetime import datetime as _dt
+            oldest = _dt.fromtimestamp(stats["oldest_seen"], tz=UTC).strftime("%Y-%m-%d")
+            text += (
+                f"\n\n<i>Прошёл {stats['pages_walked']} стр., "
+                f"посчитано до {oldest}. "
+                f"«Всё время» — оценка снизу.</i>"
+            )
+        try:
+            await message.bot.edit_message_text(
+                text,
+                chat_id=message.chat.id,
+                message_id=progress.message_id,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except TelegramBadRequest:
+            await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+
+    async def _compute_offtop_stats(user_id: int) -> dict:
+        now = int(time.time())
+        cutoff_12h = now - 12 * 3600
+        cutoff_7d = now - 7 * 86400
+        likes_12h = likes_7d = likes_total = 0
+        posts_12h = posts_7d = posts_total = 0
+        oldest_seen = now
+        pages_walked = 0
+        truncated = False
+        page = 1
+        while True:
+            data = await lolz.list_user_timeline(
+                user_id, forum_id=config.lolz_offtop_forum_id, page=page, limit=50
+            )
+            items = data.get("data") or []
+            posts_in_page = [it for it in items if it.get("content_type") == "post"]
+            for p in posts_in_page:
+                ts = int(p.get("post_create_date") or 0)
+                likes = int(p.get("post_like_count") or 0)
+                posts_total += 1
+                likes_total += likes
+                if ts >= cutoff_7d:
+                    posts_7d += 1
+                    likes_7d += likes
+                if ts >= cutoff_12h:
+                    posts_12h += 1
+                    likes_12h += likes
+                if ts and ts < oldest_seen:
+                    oldest_seen = ts
+            pages_walked += 1
+            links = data.get("links") or {}
+            total_pages = int(links.get("pages") or page)
+            if page >= total_pages:
+                break
+            if pages_walked >= _STATS_PAGE_LIMIT:
+                truncated = True
+                break
+            page += 1
+        return {
+            "likes_12h": likes_12h,
+            "likes_7d": likes_7d,
+            "likes_total": likes_total,
+            "posts_12h": posts_12h,
+            "posts_7d": posts_7d,
+            "posts_total": posts_total,
+            "pages_walked": pages_walked,
+            "oldest_seen": oldest_seen,
+            "truncated": truncated,
+        }
 
     async def _begin_create_thread(message: Message) -> None:
         prompt = await message.answer(

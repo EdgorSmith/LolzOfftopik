@@ -7,6 +7,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardBu
 START_BUTTON_TEXT = "▶ Начать оффтопить"
 STOP_BUTTON_TEXT = "⏹ Окончить оффтоп"
 CREATE_THREAD_BUTTON_TEXT = "📝 Создать тему"
+STATS_BUTTON_TEXT = "📊 Статистика"
 
 
 def main_menu(polling_enabled: bool) -> ReplyKeyboardMarkup:
@@ -14,7 +15,10 @@ def main_menu(polling_enabled: bool) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=label)],
-            [KeyboardButton(text=CREATE_THREAD_BUTTON_TEXT)],
+            [
+                KeyboardButton(text=CREATE_THREAD_BUTTON_TEXT),
+                KeyboardButton(text=STATS_BUTTON_TEXT),
+            ],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
