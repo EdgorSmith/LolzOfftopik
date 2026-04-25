@@ -160,6 +160,25 @@ class LolzClient:
     async def unlike_post(self, post_id: int) -> None:
         await self._request("DELETE", f"/posts/{post_id}/likes")
 
+    async def delete_post(self, post_id: int, reason: str = "") -> None:
+        params = {"reason": reason} if reason else None
+        await self._request("DELETE", f"/posts/{post_id}", params=params)
+
+    async def delete_thread(self, thread_id: int, reason: str = "") -> None:
+        params = {"reason": reason} if reason else None
+        await self._request("DELETE", f"/threads/{thread_id}", params=params)
+
+    # ----- users ---------------------------------------------------------------
+
+    async def me(self) -> dict:
+        """Returns the authenticated user's record."""
+        data = await self._request("GET", "/users/me")
+        return data.get("user") or {}
+
+    async def get_user(self, user_id: int) -> dict:
+        data = await self._request("GET", f"/users/{user_id}")
+        return data.get("user") or {}
+
 
 class LolzApiError(RuntimeError):
     def __init__(self, status: int, body: str) -> None:

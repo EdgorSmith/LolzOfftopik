@@ -57,7 +57,18 @@ def _format_card_html(thread: Thread, *, for_caption: bool) -> str:
 async def send_thread_card(bot: Bot, store: Store, chat_id: int, thread: Thread) -> Message | None:
     """Send a single Telegram message for the thread, with media if any. Returns the sent message."""
     media = extract_media(thread.first_post_body_html)
-    kb = thread_card_kb(thread.thread_id, thread.first_post_id, is_liked=thread.is_liked)
+    is_own = bool(
+        store.self_user_id
+        and thread.creator_user_id
+        and store.self_user_id == thread.creator_user_id
+    )
+    kb = thread_card_kb(
+        thread.thread_id,
+        thread.first_post_id,
+        is_liked=thread.is_liked,
+        creator_user_id=thread.creator_user_id,
+        is_own=is_own,
+    )
 
     msg: Message | None = None
 
@@ -88,7 +99,13 @@ async def send_thread_card(bot: Bot, store: Store, chat_id: int, thread: Thread)
 
     if msg is not None:
         is_photo_card = msg.photo is not None or msg.video is not None
-        await store.add_card(chat_id, msg.message_id, thread.thread_id, is_photo_card=is_photo_card)
+        await store.add_card(
+            chat_id,
+            msg.message_id,
+            thread.thread_id,
+            is_photo_card=is_photo_card,
+            creator_user_id=thread.creator_user_id,
+        )
     return msg
 
 

@@ -20,6 +20,7 @@ class CardRecord:
     post_id: int | None  # the user's reply post id (NULL until they reply)
     state: str  # 'pending' (waiting for action) or 'replied'
     is_photo_card: int  # 1 if the original card was sent as a photo (caption-based), else 0
+    creator_user_id: int = 0  # user_id of the thread's OP (used for "is_own" UI checks)
 
 
 _SCHEMA = """
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS cards (
     post_id INTEGER,
     state TEXT NOT NULL DEFAULT 'pending',
     is_photo_card INTEGER NOT NULL DEFAULT 0,
+    creator_user_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (chat_id, message_id)
 );
 
@@ -71,12 +73,18 @@ class Store:
         self.path = path
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self._lock = asyncio.Lock()
+        # In-memory cache of /users/me — populated by main.py at startup.
+        self._self_user_id: int = 0
+        self._self_username: str = ""
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
             # Safe additive migration for existing databases.
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(pending_actions)").fetchall()}
             if "payload" not in cols:
                 conn.execute("ALTER TABLE pending_actions ADD COLUMN payload TEXT")
+            cards_cols = {row["name"] for row in conn.execute("PRAGMA table_info(cards)").fetchall()}
+            if "creator_user_id" not in cards_cols:
+                conn.execute("ALTER TABLE cards ADD COLUMN creator_user_id INTEGER NOT NULL DEFAULT 0")
             conn.commit()
 
     @contextmanager
@@ -149,13 +157,21 @@ class Store:
 
     # ----- cards ----------------------------------------------------------------
 
-    async def add_card(self, chat_id: int, message_id: int, thread_id: int, is_photo_card: bool) -> None:
+    async def add_card(
+        self,
+        chat_id: int,
+        message_id: int,
+        thread_id: int,
+        is_photo_card: bool,
+        creator_user_id: int = 0,
+    ) -> None:
         async with self._lock:
             with self._connect() as conn:
                 conn.execute(
-                    "INSERT OR REPLACE INTO cards(chat_id,message_id,thread_id,post_id,state,is_photo_card)"
-                    " VALUES(?,?,?,NULL,'pending',?)",
-                    (chat_id, message_id, thread_id, 1 if is_photo_card else 0),
+                    "INSERT OR REPLACE INTO cards"
+                    "(chat_id,message_id,thread_id,post_id,state,is_photo_card,creator_user_id)"
+                    " VALUES(?,?,?,NULL,'pending',?,?)",
+                    (chat_id, message_id, thread_id, 1 if is_photo_card else 0, int(creator_user_id or 0)),
                 )
                 conn.commit()
 
@@ -163,7 +179,7 @@ class Store:
         async with self._lock:
             with self._connect() as conn:
                 row = conn.execute(
-                    "SELECT chat_id,message_id,thread_id,post_id,state,is_photo_card "
+                    "SELECT chat_id,message_id,thread_id,post_id,state,is_photo_card,creator_user_id "
                     "FROM cards WHERE chat_id=? AND message_id=?",
                     (chat_id, message_id),
                 ).fetchone()
@@ -203,6 +219,20 @@ class Store:
                     (thread_id, post_id, chat_id, message_id),
                 )
                 conn.commit()
+
+    # ----- self-user cache (in-memory) -----------------------------------------
+
+    def set_self_user(self, user_id: int, username: str) -> None:
+        self._self_user_id = int(user_id or 0)
+        self._self_username = str(username or "")
+
+    @property
+    def self_user_id(self) -> int:
+        return self._self_user_id
+
+    @property
+    def self_username(self) -> str:
+        return self._self_username
 
     # ----- pending actions ------------------------------------------------------
 

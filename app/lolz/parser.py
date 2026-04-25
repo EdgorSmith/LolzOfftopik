@@ -22,6 +22,7 @@ class Thread:
     thread_id: int
     title: str
     creator_username: str
+    creator_user_id: int
     permalink: str
     first_post_id: int
     first_post_body: str
@@ -223,6 +224,7 @@ def parse_thread(raw: dict) -> Thread:
         thread_id=int(raw["thread_id"]),
         title=str(raw.get("thread_title", "")).strip(),
         creator_username=str(raw.get("creator_username", "")),
+        creator_user_id=int(raw.get("creator_user_id", 0) or 0),
         permalink=str(
             ((raw.get("links") or {}).get("permalink")) or f"https://lolz.live/threads/{raw['thread_id']}/"
         ),

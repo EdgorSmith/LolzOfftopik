@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -24,6 +25,8 @@ from app.bot.keyboards import (
     CREATE_THREAD_BUTTON_TEXT,
     START_BUTTON_TEXT,
     STOP_BUTTON_TEXT,
+    cancel_kb,
+    confirm_kb,
     main_menu,
     reply_like_kb,
     thread_card_kb,
@@ -143,6 +146,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             reply_markup=ForceReply(input_field_placeholder="Заголовок..."),
         )
         await store.set_pending_create_title(message.chat.id, prompt.message_id)
+        await message.answer("Передумал?", reply_markup=cancel_kb(prompt.message_id))
 
     # ----- inline buttons: like / reply / edit --------------------------------
 
@@ -174,13 +178,170 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
         card = await store.get_card(cq.message.chat.id, cq.message.message_id) if cq.message else None
         if not card or card.state != "pending":
             return
-        new_kb = thread_card_kb(card.thread_id, post_id, is_liked=not currently_liked)
+        is_own = bool(
+            store.self_user_id and card.creator_user_id and store.self_user_id == card.creator_user_id
+        )
+        new_kb = thread_card_kb(
+            card.thread_id,
+            post_id,
+            is_liked=not currently_liked,
+            creator_user_id=card.creator_user_id,
+            is_own=is_own,
+        )
         try:
             await bot.edit_message_reply_markup(
                 chat_id=cq.message.chat.id, message_id=cq.message.message_id, reply_markup=new_kb
             )
         except TelegramBadRequest:
             pass
+
+    @router.callback_query(F.data == "noop")
+    async def cb_noop(cq: CallbackQuery) -> None:
+        # The "no" half of confirm dialogs etc. — just dismiss.
+        if cq.message:
+            try:
+                await cq.message.delete()
+            except TelegramBadRequest:
+                pass
+        await cq.answer()
+
+    @router.callback_query(F.data.startswith("cancel:"))
+    async def cb_cancel(cq: CallbackQuery, bot: Bot) -> None:
+        try:
+            _, prompt_msg_id_str = cq.data.split(":", 1)
+            prompt_msg_id = int(prompt_msg_id_str)
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        # Drop the pending action and clean up both messages.
+        await store.pop_pending(cq.message.chat.id, prompt_msg_id)
+        await _safe_delete(bot, cq.message.chat.id, prompt_msg_id)
+        await _safe_delete(bot, cq.message.chat.id, cq.message.message_id)
+        await cq.answer("❌ Отменено")
+        await _reattach_main_menu(bot, store, cq.message.chat.id)
+
+    # ----- profile / delete buttons -------------------------------------------
+
+    @router.callback_query(F.data.startswith("profile:"))
+    async def cb_profile(cq: CallbackQuery) -> None:
+        if not await store.is_unlocked():
+            await cq.answer("Бот заблокирован.", show_alert=True)
+            return
+        try:
+            _, user_id_str = cq.data.split(":", 1)
+            user_id = int(user_id_str)
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        await cq.answer("Гружу профиль…")
+        try:
+            user = await lolz.get_user(user_id)
+        except LolzApiError as e:
+            await cq.message.answer(f"⚠ Не удалось получить профиль: {e}")
+            return
+        if not user:
+            await cq.message.answer("Профиль не найден.")
+            return
+        text, avatar_url = _format_profile(user)
+        if avatar_url:
+            try:
+                await cq.message.answer_photo(avatar_url, caption=text, parse_mode="HTML")
+                return
+            except TelegramBadRequest as e:
+                log.warning("profile photo failed: %s", e)
+        await cq.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+
+    @router.callback_query(F.data.startswith("delpost:"))
+    async def cb_delpost(cq: CallbackQuery) -> None:
+        if not await store.is_unlocked():
+            await cq.answer("Бот заблокирован.", show_alert=True)
+            return
+        try:
+            _, post_id_str = cq.data.split(":", 1)
+            post_id = int(post_id_str)
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        await cq.message.answer(
+            f"🗑 Удалить пост #{post_id}?",
+            reply_markup=confirm_kb(yes_data=f"delpost_yes:{post_id}:{cq.message.message_id}"),
+        )
+        await cq.answer()
+
+    @router.callback_query(F.data.startswith("delpost_yes:"))
+    async def cb_delpost_yes(cq: CallbackQuery, bot: Bot) -> None:
+        if not await store.is_unlocked():
+            await cq.answer("Бот заблокирован.", show_alert=True)
+            return
+        try:
+            _, post_id_str, source_msg_id_str = cq.data.split(":", 2)
+            post_id = int(post_id_str)
+            source_msg_id = int(source_msg_id_str)
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        try:
+            await lolz.delete_post(post_id)
+        except LolzApiError as e:
+            await cq.answer(f"Ошибка: {e}", show_alert=True)
+            return
+        await cq.answer("🗑 Пост удалён")
+        # Drop the confirm dialog itself.
+        if cq.message:
+            await _safe_delete(bot, cq.message.chat.id, cq.message.message_id)
+            # And the original card whose Delete button we clicked.
+            await _safe_delete(bot, cq.message.chat.id, source_msg_id)
+
+    @router.callback_query(F.data.startswith("delthread:"))
+    async def cb_delthread(cq: CallbackQuery) -> None:
+        if not await store.is_unlocked():
+            await cq.answer("Бот заблокирован.", show_alert=True)
+            return
+        try:
+            _, thread_id_str = cq.data.split(":", 1)
+            thread_id = int(thread_id_str)
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        await cq.message.answer(
+            f"🗑 Удалить тему #{thread_id}?",
+            reply_markup=confirm_kb(yes_data=f"delthread_yes:{thread_id}:{cq.message.message_id}"),
+        )
+        await cq.answer()
+
+    @router.callback_query(F.data.startswith("delthread_yes:"))
+    async def cb_delthread_yes(cq: CallbackQuery, bot: Bot) -> None:
+        if not await store.is_unlocked():
+            await cq.answer("Бот заблокирован.", show_alert=True)
+            return
+        try:
+            _, thread_id_str, source_msg_id_str = cq.data.split(":", 2)
+            thread_id = int(thread_id_str)
+            source_msg_id = int(source_msg_id_str)
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        try:
+            await lolz.delete_thread(thread_id)
+        except LolzApiError as e:
+            await cq.answer(f"Ошибка: {e}", show_alert=True)
+            return
+        await cq.answer("🗑 Тема удалена")
+        if cq.message:
+            await _safe_delete(bot, cq.message.chat.id, cq.message.message_id)
+            await _safe_delete(bot, cq.message.chat.id, source_msg_id)
 
     @router.callback_query(F.data.startswith("rlike:"))
     async def cb_rlike(cq: CallbackQuery, bot: Bot) -> None:
@@ -242,6 +403,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             card_chat_id=cq.message.chat.id,
             card_message_id=cq.message.message_id,
         )
+        await cq.message.answer("Передумал?", reply_markup=cancel_kb(prompt.message_id))
         await cq.answer()
 
     @router.callback_query(F.data.startswith("edit:"))
@@ -270,6 +432,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             card_chat_id=cq.message.chat.id,
             card_message_id=cq.message.message_id,
         )
+        await cq.message.answer("Передумал?", reply_markup=cancel_kb(prompt.message_id))
         await cq.answer()
 
     # ----- view replies -------------------------------------------------------
@@ -336,6 +499,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
                 reply_markup=ForceReply(input_field_placeholder="Текст темы..."),
             )
             await store.set_pending_create_body(message.chat.id, prompt.message_id, title_text)
+            await message.answer("Передумал?", reply_markup=cancel_kb(prompt.message_id))
             await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
             return
 
@@ -419,6 +583,52 @@ async def _safe_delete(bot: Bot, chat_id: int, message_id: int) -> None:
         await bot.delete_message(chat_id, message_id)
     except TelegramBadRequest:
         pass
+
+
+def _format_profile(user: dict) -> tuple[str, str | None]:
+    """Render a lolz user dict into HTML for Telegram. Returns (text, avatar_url|None)."""
+    username = str(user.get("username", "?"))
+    user_id = int(user.get("user_id", 0) or 0)
+    title = str(user.get("user_title") or "")
+    msg_count = user.get("user_message_count")
+    like_count = user.get("user_like_count")
+    register_ts = user.get("user_register_date")
+    last_seen_ts = user.get("user_last_seen_date")
+    is_banned = bool(user.get("user_is_banned"))
+    profile_url = (
+        ((user.get("links") or {}).get("permalink"))
+        or f"https://lolz.live/members/{user_id}/"
+    )
+    avatar = (user.get("links") or {}).get("avatar_big") or (user.get("links") or {}).get("avatar")
+    if avatar and avatar.startswith("//"):
+        avatar = "https:" + avatar
+    elif avatar and avatar.startswith("/"):
+        avatar = "https://lolz.live" + avatar
+
+    def _fmt_ts(ts) -> str:
+        try:
+            from datetime import datetime
+            return datetime.fromtimestamp(int(ts), tz=UTC).strftime("%Y-%m-%d")
+        except Exception:  # noqa: BLE001
+            return "?"
+
+    lines = [
+        f"👤 <b>{hd.quote(username)}</b>" + (" 🚫" if is_banned else ""),
+        f"id: <code>{user_id}</code>" + (f" · {hd.quote(title)}" if title else ""),
+    ]
+    stats: list[str] = []
+    if msg_count is not None:
+        stats.append(f"💬 {msg_count}")
+    if like_count is not None:
+        stats.append(f"❤ {like_count}")
+    if stats:
+        lines.append(" · ".join(stats))
+    if register_ts:
+        lines.append(f"📅 рег: {_fmt_ts(register_ts)}")
+    if last_seen_ts:
+        lines.append(f"👁 был: {_fmt_ts(last_seen_ts)}")
+    lines.append(f'🌐 <a href="{profile_url}">Открыть профиль</a>')
+    return "\n".join(lines), (avatar or None)
 
 
 async def _reattach_main_menu(bot: Bot, store: Store, chat_id: int) -> None:

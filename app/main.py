@@ -30,6 +30,19 @@ async def amain() -> None:
     store = Store(config.db_path)
     lolz = LolzClient(config.lolz_api_base, config.lolz_api_token)
 
+    # Fetch /users/me to learn our own username/id, used for "is this my thread/post"
+    # checks (delete buttons, etc.). Best-effort — failure is non-fatal.
+    try:
+        me = await lolz.me()
+        if me:
+            store.set_self_user(int(me.get("user_id", 0) or 0), str(me.get("username", "")))
+            logging.getLogger(__name__).info(
+                "Authenticated as user_id=%s username=%s",
+                store.self_user_id, store.self_username,
+            )
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger(__name__).warning("/users/me lookup failed: %s", e)
+
     bot = Bot(
         config.telegram_bot_token,
         default=DefaultBotProperties(parse_mode="HTML"),
