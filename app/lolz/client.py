@@ -137,6 +137,20 @@ class LolzClient:
         post = data.get("post") or {}
         return int(post.get("post_id", 0))
 
+    async def create_thread(self, forum_id: int, title: str, body: str) -> int:
+        """Create a new thread in the given forum. Returns new thread_id."""
+        data = await self._request(
+            "POST",
+            "/threads",
+            data={
+                "forum_id": forum_id,
+                "thread_title": title,
+                "post_body": body,
+            },
+        )
+        thread = data.get("thread") or {}
+        return int(thread.get("thread_id", 0))
+
     async def edit_post(self, post_id: int, body: str) -> None:
         await self._request("PUT", f"/posts/{post_id}", data={"post_body": body})
 

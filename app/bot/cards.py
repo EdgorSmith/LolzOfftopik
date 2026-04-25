@@ -9,7 +9,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
 from aiogram.utils.text_decorations import html_decoration as hd
 
-from app.bot.keyboards import replied_kb, thread_card_kb
+from app.bot.keyboards import replied_kb, reply_like_kb, thread_card_kb
 from app.db import Store
 from app.lolz import (
     Thread,
@@ -229,21 +229,9 @@ async def send_replies(
         )
         return
 
+    # Header summarises the count, no like button.
     header = f"💬 {hd.bold('Ответы в теме')} ({len(candidates)})"
-    text_buffer: list[str] = [header]
-
-    async def flush_text_buffer() -> None:
-        nonlocal text_buffer
-        if len(text_buffer) <= 0:
-            return
-        # Avoid sending an empty buffer (only header).
-        if len(text_buffer) == 1 and text_buffer[0] == header:
-            return
-        chunk = "\n\n".join(text_buffer)
-        if len(chunk) > _TG_TEXT_LIMIT:
-            chunk = chunk[: _TG_TEXT_LIMIT - 4] + "…"
-        await bot.send_message(chat_id, chunk, parse_mode="HTML", disable_web_page_preview=True)
-        text_buffer = []  # subsequent batches start without the header
+    await bot.send_message(chat_id, header, parse_mode="HTML", disable_web_page_preview=True)
 
     for p in candidates:
         username = (p.get("poster_username") or "unknown").strip() or "unknown"
@@ -252,41 +240,49 @@ async def send_replies(
         kind = _detect_media_kind(body_html)
         label = _REPLY_TYPE_LABELS.get(kind or "", "")
         media = extract_media(body_html)
+        post_id = int(p.get("post_id", 0))
+        is_liked = bool(p.get("post_is_liked"))
+        kb = reply_like_kb(post_id, is_liked) if post_id else None
 
         head = hd.bold(hd.quote(username))
-        text_only_block = _build_text_block(head, body_text, label)
 
         # Try to send this reply as media when we have a usable URL.
         media_url: str | None = None
         send_kind: str | None = None
         if kind == "video" and media.videos:
-            media_url = media.videos[0]
-            send_kind = "video"
+            media_url, send_kind = media.videos[0], "video"
         elif kind == "animation" and media.photos:
-            media_url = media.photos[0]
-            send_kind = "animation"
+            media_url, send_kind = media.photos[0], "animation"
         elif kind == "photo" and media.photos:
-            media_url = media.photos[0]
-            send_kind = "photo"
+            media_url, send_kind = media.photos[0], "photo"
 
         if media_url and send_kind:
-            await flush_text_buffer()
-            # When the reply is sent as actual media we drop the "photo" label
-            # — it's redundant because the photo/video is already visible in TG.
+            # Drop the "photo" label — the media is already visible in TG.
             caption_block = _build_text_block(head, body_text, label=None)
             caption = caption_block if len(caption_block) <= 1024 else caption_block[:1023] + "…"
             try:
                 if send_kind == "video":
-                    await bot.send_video(chat_id, media_url, caption=caption, parse_mode="HTML")
+                    await bot.send_video(
+                        chat_id, media_url, caption=caption, reply_markup=kb, parse_mode="HTML"
+                    )
                 elif send_kind == "animation":
-                    await bot.send_animation(chat_id, media_url, caption=caption, parse_mode="HTML")
+                    await bot.send_animation(
+                        chat_id, media_url, caption=caption, reply_markup=kb, parse_mode="HTML"
+                    )
                 else:
-                    await bot.send_photo(chat_id, media_url, caption=caption, parse_mode="HTML")
+                    await bot.send_photo(
+                        chat_id, media_url, caption=caption, reply_markup=kb, parse_mode="HTML"
+                    )
+                continue
             except TelegramBadRequest as e:
                 log.warning("send media for reply failed: %s; falling back to text", e)
-                # Fallback: include the label so the user still knows there was media.
-                text_buffer.append(text_only_block)
-        else:
-            text_buffer.append(text_only_block)
+                # Falls through to the text path with the label restored.
 
-    await flush_text_buffer()
+        text_block = _build_text_block(head, body_text, label)
+        if not text_block.strip():
+            continue
+        if len(text_block) > _TG_TEXT_LIMIT:
+            text_block = text_block[: _TG_TEXT_LIMIT - 4] + "…"
+        await bot.send_message(
+            chat_id, text_block, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True
+        )

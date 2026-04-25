@@ -48,11 +48,12 @@ CREATE INDEX IF NOT EXISTS idx_cards_thread ON cards(thread_id);
 CREATE TABLE IF NOT EXISTS pending_actions (
     chat_id INTEGER NOT NULL,
     prompt_message_id INTEGER NOT NULL,
-    action TEXT NOT NULL,        -- 'reply' | 'edit'
+    action TEXT NOT NULL,        -- 'reply' | 'edit' | 'create_title' | 'create_body'
     target_thread_id INTEGER,    -- for 'reply'
     target_post_id INTEGER,      -- for 'edit'
     card_chat_id INTEGER NOT NULL,
     card_message_id INTEGER NOT NULL,
+    payload TEXT,                -- multi-step state (e.g. title between create_title and create_body)
     PRIMARY KEY (chat_id, prompt_message_id)
 );
 
@@ -72,6 +73,10 @@ class Store:
         self._lock = asyncio.Lock()
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            # Safe additive migration for existing databases.
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(pending_actions)").fetchall()}
+            if "payload" not in cols:
+                conn.execute("ALTER TABLE pending_actions ADD COLUMN payload TEXT")
             conn.commit()
 
     @contextmanager
@@ -209,23 +214,14 @@ class Store:
         card_chat_id: int,
         card_message_id: int,
     ) -> None:
-        async with self._lock:
-            with self._connect() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO pending_actions"
-                    "(chat_id,prompt_message_id,action,target_thread_id,target_post_id,card_chat_id,card_message_id)"
-                    " VALUES(?,?,?,?,?,?,?)",
-                    (
-                        chat_id,
-                        prompt_message_id,
-                        "reply",
-                        thread_id,
-                        None,
-                        card_chat_id,
-                        card_message_id,
-                    ),
-                )
-                conn.commit()
+        await self._set_pending(
+            chat_id, prompt_message_id, "reply",
+            target_thread_id=thread_id,
+            target_post_id=None,
+            card_chat_id=card_chat_id,
+            card_message_id=card_message_id,
+            payload=None,
+        )
 
     async def set_pending_edit(
         self,
@@ -235,13 +231,61 @@ class Store:
         card_chat_id: int,
         card_message_id: int,
     ) -> None:
+        await self._set_pending(
+            chat_id, prompt_message_id, "edit",
+            target_thread_id=None,
+            target_post_id=post_id,
+            card_chat_id=card_chat_id,
+            card_message_id=card_message_id,
+            payload=None,
+        )
+
+    async def set_pending_create_title(self, chat_id: int, prompt_message_id: int) -> None:
+        await self._set_pending(
+            chat_id, prompt_message_id, "create_title",
+            target_thread_id=None,
+            target_post_id=None,
+            card_chat_id=chat_id,
+            card_message_id=prompt_message_id,
+            payload=None,
+        )
+
+    async def set_pending_create_body(
+        self, chat_id: int, prompt_message_id: int, title: str
+    ) -> None:
+        await self._set_pending(
+            chat_id, prompt_message_id, "create_body",
+            target_thread_id=None,
+            target_post_id=None,
+            card_chat_id=chat_id,
+            card_message_id=prompt_message_id,
+            payload=title,
+        )
+
+    async def _set_pending(
+        self,
+        chat_id: int,
+        prompt_message_id: int,
+        action: str,
+        *,
+        target_thread_id: int | None,
+        target_post_id: int | None,
+        card_chat_id: int,
+        card_message_id: int,
+        payload: str | None,
+    ) -> None:
         async with self._lock:
             with self._connect() as conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO pending_actions"
-                    "(chat_id,prompt_message_id,action,target_thread_id,target_post_id,card_chat_id,card_message_id)"
-                    " VALUES(?,?,?,?,?,?,?)",
-                    (chat_id, prompt_message_id, "edit", None, post_id, card_chat_id, card_message_id),
+                    "(chat_id,prompt_message_id,action,target_thread_id,target_post_id,"
+                    " card_chat_id,card_message_id,payload)"
+                    " VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        chat_id, prompt_message_id, action,
+                        target_thread_id, target_post_id,
+                        card_chat_id, card_message_id, payload,
+                    ),
                 )
                 conn.commit()
 
@@ -271,7 +315,7 @@ class Store:
         async with self._lock:
             with self._connect() as conn:
                 row = conn.execute(
-                    "SELECT action,target_thread_id,target_post_id,card_chat_id,card_message_id "
+                    "SELECT action,target_thread_id,target_post_id,card_chat_id,card_message_id,payload "
                     "FROM pending_actions WHERE chat_id=? AND prompt_message_id=?",
                     (chat_id, prompt_message_id),
                 ).fetchone()

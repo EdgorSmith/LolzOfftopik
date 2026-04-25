@@ -21,9 +21,11 @@ from app.bot.cards import (
     update_replied_card_text,
 )
 from app.bot.keyboards import (
+    CREATE_THREAD_BUTTON_TEXT,
     START_BUTTON_TEXT,
     STOP_BUTTON_TEXT,
     main_menu,
+    reply_like_kb,
     thread_card_kb,
 )
 from app.config import Config
@@ -97,6 +99,9 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
         if text in (STOP_BUTTON_TEXT, "/offtop_off"):
             await _stop_polling(message)
             return
+        if text in (CREATE_THREAD_BUTTON_TEXT, "/new_thread"):
+            await _begin_create_thread(message)
+            return
 
         # Otherwise — show the menu.
         polling = await store.is_polling_enabled()
@@ -132,6 +137,13 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
         await store.set_polling_enabled(False)
         await message.answer("⏹ Оффтоп остановлен.", reply_markup=main_menu(False))
 
+    async def _begin_create_thread(message: Message) -> None:
+        prompt = await message.answer(
+            "📝 Пришли заголовок темы (одной строкой):",
+            reply_markup=ForceReply(input_field_placeholder="Заголовок..."),
+        )
+        await store.set_pending_create_title(message.chat.id, prompt.message_id)
+
     # ----- inline buttons: like / reply / edit --------------------------------
 
     @router.callback_query(F.data.startswith("like:"))
@@ -163,6 +175,40 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
         if not card or card.state != "pending":
             return
         new_kb = thread_card_kb(card.thread_id, post_id, is_liked=not currently_liked)
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=cq.message.chat.id, message_id=cq.message.message_id, reply_markup=new_kb
+            )
+        except TelegramBadRequest:
+            pass
+
+    @router.callback_query(F.data.startswith("rlike:"))
+    async def cb_rlike(cq: CallbackQuery, bot: Bot) -> None:
+        """Compact ❤ button under each reply in the 'view replies' view."""
+        if not await store.is_unlocked():
+            await cq.answer("Бот заблокирован, отправь пароль.", show_alert=True)
+            return
+        try:
+            _, post_id_str, is_liked_str = cq.data.split(":", 2)
+            post_id = int(post_id_str)
+            currently_liked = bool(int(is_liked_str))
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        try:
+            if currently_liked:
+                await lolz.unlike_post(post_id)
+                await cq.answer("💔 Лайк убран")
+            else:
+                await lolz.like_post(post_id)
+                await cq.answer("❤ Лайкнул")
+        except LolzApiError as e:
+            log.warning("rlike failed: %s", e)
+            await cq.answer(f"Ошибка: {e}", show_alert=True)
+            return
+        if not cq.message:
+            return
+        new_kb = reply_like_kb(post_id, is_liked=not currently_liked)
         try:
             await bot.edit_message_reply_markup(
                 chat_id=cq.message.chat.id, message_id=cq.message.message_id, reply_markup=new_kb
@@ -278,7 +324,45 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
         # The TG-side preview should not include BBCode noise.
         display_text = caption or _media_kind_label(message)
         action = pending["action"]
+
+        # Multi-step thread-creation: title is captured in step 1, body in step 2.
+        if action == "create_title":
+            title_text = (message.text or message.caption or "").strip()
+            if not title_text:
+                await message.answer("Заголовок пустой — отменено.")
+                return
+            prompt = await message.answer(
+                "📝 Теперь пришли текст темы (можно с фото / видео / гифкой и подписью):",
+                reply_markup=ForceReply(input_field_placeholder="Текст темы..."),
+            )
+            await store.set_pending_create_body(message.chat.id, prompt.message_id, title_text)
+            await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
+            return
+
         try:
+            if action == "create_body":
+                title_text = pending.get("payload") or "(без заголовка)"
+                try:
+                    new_thread_id = await lolz.create_thread(
+                        config.lolz_offtop_forum_id, title_text, body
+                    )
+                except LolzApiError as e:
+                    log.exception("create_thread failed: %s", e)
+                    await message.answer(f"⚠ Не удалось создать тему: {e}")
+                    return
+                if not new_thread_id:
+                    await message.answer("⚠ API не вернул thread_id, тема могла не создаться.")
+                    return
+                link = f"https://lolz.live/threads/{new_thread_id}/"
+                await message.answer(
+                    f"✅ {hd.bold('Тема создана')}: {hd.link(hd.quote(title_text), link)}",
+                    parse_mode="HTML",
+                    disable_web_page_preview=False,
+                )
+                await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
+                await _safe_delete(bot, message.chat.id, message.message_id)
+                await _reattach_main_menu(bot, store, message.chat.id)
+                return
             if action == "reply":
                 thread_id = int(pending["target_thread_id"])
                 post_id = await lolz.reply(thread_id, body)
