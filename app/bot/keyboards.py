@@ -28,8 +28,10 @@ def thread_card_kb(
     *,
     creator_user_id: int = 0,
     is_own: bool = False,
+    like_count: int = 0,
 ) -> InlineKeyboardMarkup:
-    like_text = "💔" if is_liked else "❤"
+    icon = "💔" if is_liked else "❤"
+    like_text = f"{icon} {like_count}" if like_count else icon
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(text=like_text, callback_data=f"like:{post_id}:{int(is_liked)}"),
@@ -47,13 +49,15 @@ def thread_card_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def reply_like_kb(post_id: int, is_liked: bool) -> InlineKeyboardMarkup:
-    """Compact one-button keyboard for liking a single reply post."""
+def reply_like_kb(post_id: int, is_liked: bool, like_count: int = 0) -> InlineKeyboardMarkup:
+    """Compact keyboard under each reply: ❤ (with count) + ↩ reply-to-this-post."""
     icon = "💔" if is_liked else "❤"
+    like_text = f"{icon} {like_count}" if like_count else icon
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=icon, callback_data=f"rlike:{post_id}:{int(is_liked)}")]
-        ]
+        inline_keyboard=[[
+            InlineKeyboardButton(text=like_text, callback_data=f"rlike:{post_id}:{int(is_liked)}"),
+            InlineKeyboardButton(text="↩", callback_data=f"rreply:{post_id}"),
+        ]]
     )
 
 

@@ -181,12 +181,15 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
         is_own = bool(
             store.self_user_id and card.creator_user_id and store.self_user_id == card.creator_user_id
         )
+        prev_count = _read_like_count_from_kb(cq.message.reply_markup)
+        new_count = max(0, prev_count + (-1 if currently_liked else 1))
         new_kb = thread_card_kb(
             card.thread_id,
             post_id,
             is_liked=not currently_liked,
             creator_user_id=card.creator_user_id,
             is_own=is_own,
+            like_count=new_count,
         )
         try:
             await bot.edit_message_reply_markup(
@@ -369,13 +372,58 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             return
         if not cq.message:
             return
-        new_kb = reply_like_kb(post_id, is_liked=not currently_liked)
+        prev_count = _read_like_count_from_kb(cq.message.reply_markup)
+        new_count = max(0, prev_count + (-1 if currently_liked else 1))
+        new_kb = reply_like_kb(post_id, is_liked=not currently_liked, like_count=new_count)
         try:
             await bot.edit_message_reply_markup(
                 chat_id=cq.message.chat.id, message_id=cq.message.message_id, reply_markup=new_kb
             )
         except TelegramBadRequest:
             pass
+
+    @router.callback_query(F.data.startswith("rreply:"))
+    async def cb_rreply(cq: CallbackQuery) -> None:
+        """Reply to a specific post (from the View Replies stream)."""
+        if not await store.is_unlocked():
+            await cq.answer("Бот заблокирован.", show_alert=True)
+            return
+        try:
+            _, post_id_str = cq.data.split(":", 1)
+            post_id = int(post_id_str)
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        # Need to know which thread this post belongs to so the reply lands in
+        # the right place. We fetch it from the API on demand.
+        try:
+            post_data = await lolz._request("GET", f"/posts/{post_id}")
+        except LolzApiError as e:
+            await cq.answer(f"Ошибка: {e}", show_alert=True)
+            return
+        post = post_data.get("post") or {}
+        thread_id = int(post.get("thread_id", 0) or 0)
+        if not thread_id:
+            await cq.answer("Не удалось определить тему.", show_alert=True)
+            return
+        prompt = await cq.message.answer(
+            f"↩ Напиши ответ на пост #{post_id}.\n"
+            f"Можно текстом, фото, видео или гифкой (с подписью).",
+            reply_markup=ForceReply(input_field_placeholder="Ответ на пост..."),
+        )
+        await store.set_pending_reply(
+            cq.message.chat.id,
+            prompt.message_id,
+            thread_id,
+            card_chat_id=cq.message.chat.id,
+            card_message_id=cq.message.message_id,
+            quote_post_id=post_id,
+        )
+        await cq.message.answer("Передумал?", reply_markup=cancel_kb(prompt.message_id))
+        await cq.answer()
 
     @router.callback_query(F.data.startswith("reply:"))
     async def cb_reply(cq: CallbackQuery) -> None:
@@ -529,6 +577,11 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
                 return
             if action == "reply":
                 thread_id = int(pending["target_thread_id"])
+                # If this reply was triggered from a per-post ↩ button, payload
+                # holds the original post_id we should quote.
+                quote_pid_raw = pending.get("payload") or ""
+                if quote_pid_raw.isdigit():
+                    body = await _build_quoted_body(lolz, int(quote_pid_raw), body)
                 post_id = await lolz.reply(thread_id, body)
                 if not post_id:
                     raise LolzApiError(0, "API не вернул post_id")
@@ -583,6 +636,47 @@ async def _safe_delete(bot: Bot, chat_id: int, message_id: int) -> None:
         await bot.delete_message(chat_id, message_id)
     except TelegramBadRequest:
         pass
+
+
+def _read_like_count_from_kb(reply_markup) -> int:
+    """Extract the numeric like count from the first button on an inline kb.
+
+    Buttons are rendered as '❤ 12' / '💔 12' / '❤'. We just find the first
+    integer in the first button's text. Returns 0 when not present.
+    """
+    try:
+        text = reply_markup.inline_keyboard[0][0].text or ""
+    except (AttributeError, IndexError):
+        return 0
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+async def _build_quoted_body(lolz: LolzClient, quote_post_id: int, my_body: str) -> str:
+    """Prepend a forum [QUOTE] block to the user's body so the new post quotes the target.
+
+    Best-effort — if the lookup fails we just submit the body without a quote.
+    """
+    try:
+        data = await lolz._request("GET", f"/posts/{quote_post_id}")
+    except LolzApiError as e:
+        log.warning("quote lookup failed for post %s: %s", quote_post_id, e)
+        return my_body
+    post = data.get("post") or {}
+    username = str(post.get("poster_username") or "").strip()
+    member_id = int(post.get("poster_user_id", 0) or 0)
+    plain = str(post.get("post_body_plain_text") or "").strip()
+    # Truncate the quoted body so we don't blow up the post.
+    if len(plain) > 500:
+        plain = plain[:500].rstrip() + "…"
+    if not plain:
+        plain = "(вложение)"
+    head = (
+        f'[QUOTE="{username}, post: {quote_post_id}, member: {member_id}"]'
+        if username and member_id
+        else "[QUOTE]"
+    )
+    return f"{head}\n{plain}\n[/QUOTE]\n\n{my_body}"
 
 
 def _format_profile(user: dict) -> tuple[str, str | None]:

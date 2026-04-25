@@ -243,14 +243,17 @@ class Store:
         thread_id: int,
         card_chat_id: int,
         card_message_id: int,
+        quote_post_id: int | None = None,
     ) -> None:
+        # The optional quote_post_id is stored in 'payload' as a string so the
+        # submit step can prepend a [QUOTE] block when posting.
         await self._set_pending(
             chat_id, prompt_message_id, "reply",
             target_thread_id=thread_id,
             target_post_id=None,
             card_chat_id=card_chat_id,
             card_message_id=card_message_id,
-            payload=None,
+            payload=str(quote_post_id) if quote_post_id else None,
         )
 
     async def set_pending_edit(

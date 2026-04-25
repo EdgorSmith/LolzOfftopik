@@ -68,6 +68,7 @@ async def send_thread_card(bot: Bot, store: Store, chat_id: int, thread: Thread)
         is_liked=thread.is_liked,
         creator_user_id=thread.creator_user_id,
         is_own=is_own,
+        like_count=thread.like_count,
     )
 
     msg: Message | None = None
@@ -259,7 +260,8 @@ async def send_replies(
         media = extract_media(body_html)
         post_id = int(p.get("post_id", 0))
         is_liked = bool(p.get("post_is_liked"))
-        kb = reply_like_kb(post_id, is_liked) if post_id else None
+        like_count = int(p.get("post_like_count", 0) or 0)
+        kb = reply_like_kb(post_id, is_liked, like_count) if post_id else None
 
         head = hd.bold(hd.quote(username))
 

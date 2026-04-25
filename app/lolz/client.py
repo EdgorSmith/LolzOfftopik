@@ -138,13 +138,18 @@ class LolzClient:
         return int(post.get("post_id", 0))
 
     async def create_thread(self, forum_id: int, title: str, body: str) -> int:
-        """Create a new thread in the given forum. Returns new thread_id."""
+        """Create a new thread in the given forum. Returns new thread_id.
+
+        The lolz prod-api expects the title param under both 'thread_title'
+        and 'title' depending on the route version — we send both.
+        """
         data = await self._request(
             "POST",
             "/threads",
             data={
                 "forum_id": forum_id,
                 "thread_title": title,
+                "title": title,
                 "post_body": body,
             },
         )
