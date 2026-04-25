@@ -16,7 +16,7 @@ from aiogram.types import (
 from aiogram.utils.text_decorations import html_decoration as hd
 
 from app.bot.cards import (
-    render_replies,
+    send_replies,
     transition_card_to_replied,
     update_replied_card_text,
 )
@@ -229,7 +229,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
     # ----- view replies -------------------------------------------------------
 
     @router.callback_query(F.data.startswith("replies:"))
-    async def cb_replies(cq: CallbackQuery) -> None:
+    async def cb_replies(cq: CallbackQuery, bot: Bot) -> None:
         if not await store.is_unlocked():
             await cq.answer("Бот заблокирован.", show_alert=True)
             return
@@ -254,8 +254,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             log.warning("replies fetch failed: %s", e)
             await cq.message.answer(f"⚠ Не удалось получить ответы: {e}")
             return
-        body = render_replies(thread_id, posts, first_post_id=first_post_id)
-        await cq.message.answer(body, parse_mode="HTML", disable_web_page_preview=True)
+        await send_replies(bot, cq.message.chat.id, thread_id, posts, first_post_id=first_post_id)
 
     # ----- ForceReply consumer -------------------------------------------------
 
@@ -307,6 +306,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
                 # Cleanup the prompt.
                 await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
                 await _safe_delete(bot, message.chat.id, message.message_id)
+                await _reattach_main_menu(bot, store, message.chat.id)
             elif action == "edit":
                 post_id = int(pending["target_post_id"])
                 await lolz.edit_post(post_id, body)
@@ -322,6 +322,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
                 )
                 await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
                 await _safe_delete(bot, message.chat.id, message.message_id)
+                await _reattach_main_menu(bot, store, message.chat.id)
         except LolzApiError as e:
             log.exception("Force-reply action failed: %s", e)
             await message.answer(f"⚠ Ошибка lolz API: {e}")
@@ -334,6 +335,15 @@ async def _safe_delete(bot: Bot, chat_id: int, message_id: int) -> None:
         await bot.delete_message(chat_id, message_id)
     except TelegramBadRequest:
         pass
+
+
+async def _reattach_main_menu(bot: Bot, store: Store, chat_id: int) -> None:
+    """Send a tiny confirmation that re-attaches the persistent reply keyboard."""
+    polling = await store.is_polling_enabled()
+    try:
+        await bot.send_message(chat_id, "✅ Готово.", reply_markup=main_menu(polling))
+    except TelegramBadRequest as e:
+        log.warning("reattach main menu failed: %s", e)
 
 
 def _media_kind_label(message: Message) -> str:

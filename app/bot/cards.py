@@ -30,18 +30,27 @@ def _format_card_html(thread: Thread, *, for_caption: bool) -> str:
     )
     title = hd.bold(apply_emoji_map_to_escaped_html(hd.quote(thread.title or "(без заголовка)")))
     author = hd.italic(f"@{hd.quote(thread.creator_username)}")
-    body = apply_emoji_map_to_escaped_html(hd.quote(text_body)) if text_body else hd.italic("(пусто)")
     likes = thread.like_count
     likes_line = f"❤ {likes}" if likes else ""
     head = f"{title}\n{author}{(' · ' + likes_line) if likes_line else ''}"
     link = hd.link("Открыть тему", thread.permalink)
-    full = f"{head}\n\n{body}\n\n{link}"
+
+    sections: list[str] = [head]
+    if text_body:
+        sections.append(apply_emoji_map_to_escaped_html(hd.quote(text_body)))
+    sections.append(link)
+    full = "\n\n".join(sections)
+
     limit = _TG_CAPTION_LIMIT if for_caption else _TG_TEXT_LIMIT
     if len(full) > limit:
-        # Conservative trim: drop body characters until it fits.
         overflow = len(full) - limit + 1
-        trimmed_body = body[: max(0, len(body) - overflow - 1)] + "…"
-        full = f"{head}\n\n{trimmed_body}\n\n{link}"
+        if text_body:
+            body = apply_emoji_map_to_escaped_html(hd.quote(text_body))
+            trimmed_body = body[: max(0, len(body) - overflow - 1)] + "…"
+            full = f"{head}\n\n{trimmed_body}\n\n{link}"
+        else:
+            # No body to trim; truncate the whole thing.
+            full = full[: limit - 1] + "…"
     return full
 
 
@@ -153,21 +162,39 @@ _REPLY_TYPE_LABELS = {
     "photo": "photo",
     "video": "video",
     "animation": "gif",
-    "document": "file",
-    "audio": "audio",
-    "voice": "voice",
 }
 
 
-def render_replies(thread_id: int, posts: list[dict], first_post_id: int | None = None) -> str:
-    """Format up to 20 latest replies as a single Telegram message body.
+def _detect_media_kind(post_body_html: str) -> str | None:
+    """Best-effort guess of media type by inspecting tags in the post body html.
 
-    Layout per reply:
-        <b>username</b>
-        text content [italic media-tag if any]
-    Or, if there is no text:
-        <b>username</b>
-        <i>photo</i>   (or video / gif / file / ...)
+    Only real BBCode attachments count. Mentions, avatars, smileys and other
+    decorative <img> tags are explicitly ignored.
+    """
+    if not post_body_html:
+        return None
+    s = post_body_html.lower()
+    if "<video" in s:
+        return "video"
+    if "bbcodeimage" not in s:
+        return None
+    if ".gif" in s:
+        return "animation"
+    return "photo"
+
+
+async def send_replies(
+    bot: Bot,
+    chat_id: int,
+    thread_id: int,
+    posts: list[dict],
+    first_post_id: int | None = None,
+) -> None:
+    """Render replies as a sequence of Telegram messages.
+
+    - Text-only replies are batched into one or more text messages.
+    - Each reply that has a real attachment is sent as its own photo / video /
+      animation message, captioned with ``<b>nick</b>\\ntext photo``.
     """
     candidates = [p for p in posts if int(p.get("post_id", 0)) != int(first_post_id or 0)]
     candidates.sort(key=lambda p: int(p.get("post_id", 0)), reverse=True)
@@ -175,15 +202,37 @@ def render_replies(thread_id: int, posts: list[dict], first_post_id: int | None 
     candidates.sort(key=lambda p: int(p.get("post_id", 0)))
 
     if not candidates:
-        return f"💬 Ответов пока нет в {hd.link('теме', f'https://lolz.live/threads/{thread_id}/')}."
+        await bot.send_message(
+            chat_id,
+            f"💬 Ответов пока нет в {hd.link('теме', f'https://lolz.live/threads/{thread_id}/')}.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
 
-    blocks: list[str] = [f"💬 {hd.bold('Ответы в теме')} ({len(candidates)})"]
+    header = f"💬 {hd.bold('Ответы в теме')} ({len(candidates)})"
+    text_buffer: list[str] = [header]
+
+    async def flush_text_buffer() -> None:
+        nonlocal text_buffer
+        if len(text_buffer) <= 0:
+            return
+        # Avoid sending an empty buffer (only header).
+        if len(text_buffer) == 1 and text_buffer[0] == header:
+            return
+        chunk = "\n\n".join(text_buffer)
+        if len(chunk) > _TG_TEXT_LIMIT:
+            chunk = chunk[: _TG_TEXT_LIMIT - 4] + "…"
+        await bot.send_message(chat_id, chunk, parse_mode="HTML", disable_web_page_preview=True)
+        text_buffer = []  # subsequent batches start without the header
+
     for p in candidates:
         username = (p.get("poster_username") or "unknown").strip() or "unknown"
         body_html = p.get("post_body_html") or ""
         body_text = render_text_for_telegram(body_html, max_len=400).strip()
         kind = _detect_media_kind(body_html)
         label = _REPLY_TYPE_LABELS.get(kind or "", "")
+        media = extract_media(body_html)
 
         head = hd.bold(hd.quote(username))
         if body_text:
@@ -191,27 +240,37 @@ def render_replies(thread_id: int, posts: list[dict], first_post_id: int | None 
             if label:
                 content = f"{content} {hd.italic(label)}"
         else:
-            content = hd.italic(label) if label else hd.italic("(пусто)")
-        blocks.append(f"{head}\n{content}")
+            content = hd.italic(label) if label else ""
 
-    out = "\n\n".join(blocks)
-    if len(out) > _TG_TEXT_LIMIT:
-        out = out[: _TG_TEXT_LIMIT - 4] + "…"
-    return out
+        block = f"{head}\n{content}".rstrip()
 
+        # Try to send this reply as media when we have a usable URL.
+        media_url: str | None = None
+        send_kind: str | None = None
+        if kind == "video" and media.videos:
+            media_url = media.videos[0]
+            send_kind = "video"
+        elif kind == "animation" and media.photos:
+            media_url = media.photos[0]
+            send_kind = "animation"
+        elif kind == "photo" and media.photos:
+            media_url = media.photos[0]
+            send_kind = "photo"
 
-def _detect_media_kind(post_body_html: str) -> str | None:
-    """Best-effort guess of media type by inspecting tags in the post body html."""
-    if not post_body_html:
-        return None
-    s = post_body_html.lower()
-    if "<video" in s or ".mp4" in s or ".webm" in s or ".mov" in s:
-        return "video"
-    if ".gif" in s:
-        return "animation"
-    if "<img" in s:
-        # smiley-only post -> treat as empty
-        if "mcesmilie" in s and "bbcodeimage" not in s:
-            return None
-        return "photo"
-    return None
+        if media_url and send_kind:
+            await flush_text_buffer()
+            caption = block if len(block) <= 1024 else block[:1023] + "…"
+            try:
+                if send_kind == "video":
+                    await bot.send_video(chat_id, media_url, caption=caption, parse_mode="HTML")
+                elif send_kind == "animation":
+                    await bot.send_animation(chat_id, media_url, caption=caption, parse_mode="HTML")
+                else:
+                    await bot.send_photo(chat_id, media_url, caption=caption, parse_mode="HTML")
+            except TelegramBadRequest as e:
+                log.warning("send media for reply failed: %s; falling back to text", e)
+                text_buffer.append(block)
+        else:
+            text_buffer.append(block)
+
+    await flush_text_buffer()
