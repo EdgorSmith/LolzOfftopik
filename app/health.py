@@ -1,4 +1,4 @@
-"""Tiny aiohttp HTTP server with a /health endpoint for Render and cron-job.org."""
+"""Tiny aiohttp HTTP server: /health endpoint + /m/<token> file proxy."""
 
 from __future__ import annotations
 
@@ -22,11 +22,12 @@ def build_app() -> web.Application:
     return app
 
 
-async def run_http_server(port: int) -> web.AppRunner:
-    app = build_app()
+async def run_http_server(port: int, app: web.Application | None = None) -> web.AppRunner:
+    if app is None:
+        app = build_app()
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=port)
     await site.start()
-    log.info("HTTP /health listening on 0.0.0.0:%s", port)
+    log.info("HTTP server listening on 0.0.0.0:%s", port)
     return runner

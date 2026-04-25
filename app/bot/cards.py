@@ -104,7 +104,7 @@ async def transition_card_to_replied(
     if len(body) > _TG_TEXT_LIMIT:
         body = body[: _TG_TEXT_LIMIT - 1] + "…"
 
-    kb = replied_kb(post_id)
+    kb = replied_kb(thread_id, post_id)
 
     if is_photo_card:
         # Cannot turn a photo+caption message into text-only; delete and resend.
@@ -141,5 +141,77 @@ async def update_replied_card_text(
     if len(body) > _TG_TEXT_LIMIT:
         body = body[: _TG_TEXT_LIMIT - 1] + "…"
     await bot.edit_message_text(
-        body, chat_id=chat_id, message_id=message_id, reply_markup=replied_kb(post_id), parse_mode="HTML"
+        body,
+        chat_id=chat_id,
+        message_id=message_id,
+        reply_markup=replied_kb(thread_id, post_id),
+        parse_mode="HTML",
     )
+
+
+_REPLY_TYPE_LABELS = {
+    "photo": "photo",
+    "video": "video",
+    "animation": "gif",
+    "document": "file",
+    "audio": "audio",
+    "voice": "voice",
+}
+
+
+def render_replies(thread_id: int, posts: list[dict], first_post_id: int | None = None) -> str:
+    """Format up to 20 latest replies as a single Telegram message body.
+
+    Layout per reply:
+        <b>username</b>
+        text content [italic media-tag if any]
+    Or, if there is no text:
+        <b>username</b>
+        <i>photo</i>   (or video / gif / file / ...)
+    """
+    candidates = [p for p in posts if int(p.get("post_id", 0)) != int(first_post_id or 0)]
+    candidates.sort(key=lambda p: int(p.get("post_id", 0)), reverse=True)
+    candidates = candidates[:20]
+    candidates.sort(key=lambda p: int(p.get("post_id", 0)))
+
+    if not candidates:
+        return f"💬 Ответов пока нет в {hd.link('теме', f'https://lolz.live/threads/{thread_id}/')}."
+
+    blocks: list[str] = [f"💬 {hd.bold('Ответы в теме')} ({len(candidates)})"]
+    for p in candidates:
+        username = (p.get("poster_username") or "unknown").strip() or "unknown"
+        body_html = p.get("post_body_html") or ""
+        body_text = render_text_for_telegram(body_html, max_len=400).strip()
+        kind = _detect_media_kind(body_html)
+        label = _REPLY_TYPE_LABELS.get(kind or "", "")
+
+        head = hd.bold(hd.quote(username))
+        if body_text:
+            content = apply_emoji_map_to_escaped_html(hd.quote(body_text))
+            if label:
+                content = f"{content} {hd.italic(label)}"
+        else:
+            content = hd.italic(label) if label else hd.italic("(пусто)")
+        blocks.append(f"{head}\n{content}")
+
+    out = "\n\n".join(blocks)
+    if len(out) > _TG_TEXT_LIMIT:
+        out = out[: _TG_TEXT_LIMIT - 4] + "…"
+    return out
+
+
+def _detect_media_kind(post_body_html: str) -> str | None:
+    """Best-effort guess of media type by inspecting tags in the post body html."""
+    if not post_body_html:
+        return None
+    s = post_body_html.lower()
+    if "<video" in s or ".mp4" in s or ".webm" in s or ".mov" in s:
+        return "video"
+    if ".gif" in s:
+        return "animation"
+    if "<img" in s:
+        # smiley-only post -> treat as empty
+        if "mcesmilie" in s and "bbcodeimage" not in s:
+            return None
+        return "photo"
+    return None

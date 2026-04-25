@@ -16,6 +16,7 @@ from aiogram.types import (
 from aiogram.utils.text_decorations import html_decoration as hd
 
 from app.bot.cards import (
+    render_replies,
     transition_card_to_replied,
     update_replied_card_text,
 )
@@ -184,7 +185,8 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             await cq.answer()
             return
         prompt = await cq.message.answer(
-            f"✍ Напиши ответ для темы #{thread_id}:",
+            f"✍ Напиши ответ для темы #{thread_id}.\n"
+            f"Можно текстом, фото, видео или гифкой (можно с подписью).",
             reply_markup=ForceReply(input_field_placeholder="Ответ в тему..."),
         )
         await store.set_pending_reply(
@@ -211,7 +213,8 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             await cq.answer()
             return
         prompt = await cq.message.answer(
-            f"✏ Введи новый текст ответа (post_id={post_id}):",
+            f"✏ Введи новый текст ответа (post_id={post_id}).\n"
+            f"Можно текстом, фото, видео или гифкой (с подписью).",
             reply_markup=ForceReply(input_field_placeholder="Новый текст ответа..."),
         )
         await store.set_pending_edit(
@@ -222,6 +225,37 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             card_message_id=cq.message.message_id,
         )
         await cq.answer()
+
+    # ----- view replies -------------------------------------------------------
+
+    @router.callback_query(F.data.startswith("replies:"))
+    async def cb_replies(cq: CallbackQuery) -> None:
+        if not await store.is_unlocked():
+            await cq.answer("Бот заблокирован.", show_alert=True)
+            return
+        try:
+            _, thread_id_str = cq.data.split(":", 1)
+            thread_id = int(thread_id_str)
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        await cq.answer("Ищу ответы…")
+        try:
+            posts = await lolz.list_thread_posts(thread_id, limit=20, order="natural_reverse")
+            try:
+                thread = await lolz.get_thread(thread_id)
+                first_post_id = thread.first_post_id
+            except LolzApiError:
+                first_post_id = None
+        except LolzApiError as e:
+            log.warning("replies fetch failed: %s", e)
+            await cq.message.answer(f"⚠ Не удалось получить ответы: {e}")
+            return
+        body = render_replies(thread_id, posts, first_post_id=first_post_id)
+        await cq.message.answer(body, parse_mode="HTML", disable_web_page_preview=True)
 
     # ----- ForceReply consumer -------------------------------------------------
 
@@ -234,11 +268,16 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
         pending = await store.pop_pending(message.chat.id, message.reply_to_message.message_id)
         if not pending:
             return
-        body = (message.text or message.caption or "").strip()
+
+        caption = (message.text or message.caption or "").strip()
+        media_bbcode = await _build_media_bbcode(message, store, config)
+        body = _join_caption_and_media(caption, media_bbcode)
         if not body:
             await message.answer("Пустой ответ — отменено.")
             return
 
+        # The TG-side preview should not include BBCode noise.
+        display_text = caption or _media_kind_label(message)
         action = pending["action"]
         try:
             if action == "reply":
@@ -262,7 +301,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
                     is_photo_card=is_photo_card,
                     thread_id=thread_id,
                     thread_title=title,
-                    reply_text=body,
+                    reply_text=display_text,
                     post_id=post_id,
                 )
                 # Cleanup the prompt.
@@ -278,7 +317,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
                     chat_id=pending["card_chat_id"],
                     message_id=pending["card_message_id"],
                     thread_id=thread_id_for_link,
-                    new_reply_text=body,
+                    new_reply_text=display_text,
                     post_id=post_id,
                 )
                 await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
@@ -295,3 +334,85 @@ async def _safe_delete(bot: Bot, chat_id: int, message_id: int) -> None:
         await bot.delete_message(chat_id, message_id)
     except TelegramBadRequest:
         pass
+
+
+def _media_kind_label(message: Message) -> str:
+    if message.photo:
+        return "📷 photo"
+    if message.video:
+        return "🎥 video"
+    if message.animation:
+        return "🎞 gif"
+    if message.document:
+        return "📎 file"
+    return ""
+
+
+def _join_caption_and_media(caption: str, media_bbcode: str) -> str:
+    parts = [p for p in (caption, media_bbcode) if p]
+    return "\n\n".join(parts)
+
+
+_PHOTO_EXT = "jpg"
+_VIDEO_EXT = "mp4"
+_ANIM_EXT = "mp4"
+_DOC_EXT_BY_MIME = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+    "video/quicktime": "mov",
+}
+
+
+async def _build_media_bbcode(message: Message, store: Store, config: Config) -> str:
+    """Inspect the TG message for media; if any, host it via /m/<token> and return BBCode.
+
+    Returns an empty string if no media.
+
+    For photos: ``[IMG]<url>[/IMG]``.
+    For videos / animations / documents: bare URL on its own line (XenForo will linkify).
+    """
+    import secrets
+
+    file_id: str | None = None
+    mime_type: str | None = None
+    ext = ""
+
+    if message.photo:
+        # Largest size last.
+        file_id = message.photo[-1].file_id
+        mime_type = "image/jpeg"
+        ext = _PHOTO_EXT
+        kind = "photo"
+    elif message.video:
+        file_id = message.video.file_id
+        mime_type = message.video.mime_type or "video/mp4"
+        ext = _DOC_EXT_BY_MIME.get(mime_type, _VIDEO_EXT)
+        kind = "video"
+    elif message.animation:
+        file_id = message.animation.file_id
+        mime_type = message.animation.mime_type or "video/mp4"
+        ext = _DOC_EXT_BY_MIME.get(mime_type, _ANIM_EXT)
+        kind = "animation"
+    elif message.document:
+        file_id = message.document.file_id
+        mime_type = message.document.mime_type or "application/octet-stream"
+        ext = _DOC_EXT_BY_MIME.get(mime_type, "bin")
+        kind = "document" if not (mime_type or "").startswith("image/") else "photo"
+    else:
+        return ""
+
+    if not config.public_url:
+        log.warning("PUBLIC_URL is not set — cannot build a hostable media URL")
+        return ""
+
+    token = secrets.token_urlsafe(16)
+    await store.add_file_token(token, file_id, mime_type)
+    url = f"{config.public_url}/m/{token}.{ext}"
+
+    if kind == "photo":
+        return f"[IMG]{url}[/IMG]"
+    return url

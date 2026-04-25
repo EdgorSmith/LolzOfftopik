@@ -29,9 +29,15 @@ class Config:
     poll_interval_seconds: int
     http_port: int
     db_path: str
+    public_url: str  # e.g. "https://lolzofftopik.onrender.com" — used to host attachments for replies
 
     @classmethod
     def from_env(cls) -> Config:
+        public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
+        if not public_url:
+            host = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "")
+            if host:
+                public_url = f"https://{host}"
         return cls(
             telegram_bot_token=_required("TELEGRAM_BOT_TOKEN"),
             telegram_owner_id=int(_required("TELEGRAM_OWNER_ID")),
@@ -43,4 +49,5 @@ class Config:
             poll_interval_seconds=int(os.environ.get("POLL_INTERVAL_SECONDS", "25")),
             http_port=int(os.environ.get("PORT", "10000")),
             db_path=os.environ.get("DB_PATH", "data/state.sqlite3"),
+            public_url=public_url,
         )

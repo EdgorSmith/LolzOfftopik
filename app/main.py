@@ -6,12 +6,15 @@ import asyncio
 import logging
 import signal
 
+import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 
 from app.bot.handlers import build_router
 from app.config import Config
 from app.db import Store
+from app.file_proxy import add_routes as add_proxy_routes
+from app.health import build_app as build_http_app
 from app.health import run_http_server
 from app.lolz import LolzClient
 from app.poller import Poller
@@ -37,7 +40,14 @@ async def amain() -> None:
     poller = Poller(config, store, lolz, bot)
     poller.start()
 
-    http_runner = await run_http_server(config.http_port)
+    http_app = build_http_app()
+    add_proxy_routes(
+        http_app,
+        config,
+        store,
+        session_factory=lambda: aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)),
+    )
+    http_runner = await run_http_server(config.http_port, app=http_app)
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

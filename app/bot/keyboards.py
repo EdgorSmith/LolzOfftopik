@@ -26,18 +26,20 @@ def thread_card_kb(thread_id: int, post_id: int, is_liked: bool) -> InlineKeyboa
                 InlineKeyboardButton(text="✍ Ответить", callback_data=f"reply:{thread_id}"),
             ],
             [
-                InlineKeyboardButton(
-                    text="🔗 Открыть на форуме", url=f"https://lolz.live/threads/{thread_id}/"
-                ),
+                InlineKeyboardButton(text="💬 Посмотреть ответы", callback_data=f"replies:{thread_id}"),
+                InlineKeyboardButton(text="🔗 Тема", url=f"https://lolz.live/threads/{thread_id}/"),
             ],
         ]
     )
 
 
-def replied_kb(post_id: int) -> InlineKeyboardMarkup:
+def replied_kb(thread_id: int, post_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✏ Изменить ответ", callback_data=f"edit:{post_id}")],
+            [
+                InlineKeyboardButton(text="✏ Изменить ответ", callback_data=f"edit:{post_id}"),
+                InlineKeyboardButton(text="💬 Ответы", callback_data=f"replies:{thread_id}"),
+            ],
             [InlineKeyboardButton(text="🔗 Мой ответ", url=f"https://lolz.live/posts/{post_id}/")],
         ]
     )

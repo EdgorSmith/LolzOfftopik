@@ -55,6 +55,13 @@ CREATE TABLE IF NOT EXISTS pending_actions (
     card_message_id INTEGER NOT NULL,
     PRIMARY KEY (chat_id, prompt_message_id)
 );
+
+CREATE TABLE IF NOT EXISTS file_tokens (
+    token TEXT PRIMARY KEY,
+    file_id TEXT NOT NULL,
+    mime_type TEXT,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
 """
 
 
@@ -237,6 +244,28 @@ class Store:
                     (chat_id, prompt_message_id, "edit", None, post_id, card_chat_id, card_message_id),
                 )
                 conn.commit()
+
+    # ----- file-token mapping (Telegram file_id <-> proxy token) ---------------
+
+    async def add_file_token(self, token: str, file_id: str, mime_type: str | None) -> None:
+        async with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO file_tokens(token,file_id,mime_type) VALUES(?,?,?)",
+                    (token, file_id, mime_type),
+                )
+                conn.commit()
+
+    async def get_file_by_token(self, token: str) -> tuple[str, str | None] | None:
+        async with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT file_id, mime_type FROM file_tokens WHERE token=?",
+                    (token,),
+                ).fetchone()
+                if not row:
+                    return None
+                return row["file_id"], row["mime_type"]
 
     async def pop_pending(self, chat_id: int, prompt_message_id: int) -> dict | None:
         async with self._lock:

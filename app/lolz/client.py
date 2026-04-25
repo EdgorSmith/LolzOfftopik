@@ -113,6 +113,18 @@ class LolzClient:
         data = await self._request("GET", f"/threads/{thread_id}")
         return parse_thread(data.get("thread") or data)
 
+    async def list_thread_posts(
+        self,
+        thread_id: int,
+        *,
+        limit: int = 20,
+        order: str = "natural_reverse",
+    ) -> list[dict]:
+        """Fetch posts in a thread. Returns the raw post dicts (the bot renders them)."""
+        params = {"thread_id": thread_id, "limit": limit, "order": order}
+        data = await self._request("GET", "/posts", params=params)
+        return list(data.get("posts") or [])
+
     # ----- posts ---------------------------------------------------------------
 
     async def reply(self, thread_id: int, body: str) -> int:
