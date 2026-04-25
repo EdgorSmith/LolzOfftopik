@@ -175,7 +175,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             f"  • за 12 ч — {stats['likes_12h']}\n"
             f"  • за 7 дней — {stats['likes_7d']}\n"
             f"  • за всё время — {stats['likes_total']}\n\n"
-            f"<b>Ответов в темах</b>\n"
+            f"<b>Ответов в оффтопике</b>\n"
             f"  • за 12 ч — {stats['posts_12h']}\n"
             f"  • за 7 дней — {stats['posts_7d']}\n"
             f"  • за всё время — {stats['posts_total']}"
