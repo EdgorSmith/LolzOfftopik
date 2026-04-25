@@ -165,6 +165,25 @@ _REPLY_TYPE_LABELS = {
 }
 
 
+def _build_text_block(head_html: str, body_text: str, label: str | None) -> str:
+    """Render a per-reply text block.
+
+    head_html is already-escaped HTML (e.g. ``<b>nick</b>``). body_text is
+    plain text (will be hd.quoted here). When label is provided it is appended
+    as italic suffix to the body line; when body_text is empty the label
+    becomes the body line by itself.
+    """
+    if body_text:
+        content = apply_emoji_map_to_escaped_html(hd.quote(body_text))
+        if label:
+            content = f"{content} {hd.italic(label)}"
+    elif label:
+        content = hd.italic(label)
+    else:
+        content = ""
+    return f"{head_html}\n{content}".rstrip()
+
+
 def _detect_media_kind(post_body_html: str) -> str | None:
     """Best-effort guess of media type by inspecting tags in the post body html.
 
@@ -235,14 +254,7 @@ async def send_replies(
         media = extract_media(body_html)
 
         head = hd.bold(hd.quote(username))
-        if body_text:
-            content = apply_emoji_map_to_escaped_html(hd.quote(body_text))
-            if label:
-                content = f"{content} {hd.italic(label)}"
-        else:
-            content = hd.italic(label) if label else ""
-
-        block = f"{head}\n{content}".rstrip()
+        text_only_block = _build_text_block(head, body_text, label)
 
         # Try to send this reply as media when we have a usable URL.
         media_url: str | None = None
@@ -259,7 +271,10 @@ async def send_replies(
 
         if media_url and send_kind:
             await flush_text_buffer()
-            caption = block if len(block) <= 1024 else block[:1023] + "…"
+            # When the reply is sent as actual media we drop the "photo" label
+            # — it's redundant because the photo/video is already visible in TG.
+            caption_block = _build_text_block(head, body_text, label=None)
+            caption = caption_block if len(caption_block) <= 1024 else caption_block[:1023] + "…"
             try:
                 if send_kind == "video":
                     await bot.send_video(chat_id, media_url, caption=caption, parse_mode="HTML")
@@ -269,8 +284,9 @@ async def send_replies(
                     await bot.send_photo(chat_id, media_url, caption=caption, parse_mode="HTML")
             except TelegramBadRequest as e:
                 log.warning("send media for reply failed: %s; falling back to text", e)
-                text_buffer.append(block)
+                # Fallback: include the label so the user still knows there was media.
+                text_buffer.append(text_only_block)
         else:
-            text_buffer.append(block)
+            text_buffer.append(text_only_block)
 
     await flush_text_buffer()
