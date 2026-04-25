@@ -175,7 +175,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             f"  • за 12 ч — {stats['likes_12h']}\n"
             f"  • за 7 дней — {stats['likes_7d']}\n"
             f"  • за всё время — {stats['likes_total']}\n\n"
-            f"<b>Сообщений</b>\n"
+            f"<b>Ответов в темах</b>\n"
             f"  • за 12 ч — {stats['posts_12h']}\n"
             f"  • за 7 дней — {stats['posts_7d']}\n"
             f"  • за всё время — {stats['posts_total']}"
@@ -214,7 +214,11 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
                 user_id, forum_id=config.lolz_offtop_forum_id, page=page, limit=50
             )
             items = data.get("data") or []
-            posts_in_page = [it for it in items if it.get("content_type") == "post"]
+            # Only count replies, not the first-post of threads we created.
+            posts_in_page = [
+                it for it in items
+                if it.get("content_type") == "post" and not it.get("post_is_first_post")
+            ]
             for p in posts_in_page:
                 ts = int(p.get("post_create_date") or 0)
                 likes = int(p.get("post_like_count") or 0)
