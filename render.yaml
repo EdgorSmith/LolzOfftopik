@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: lolzofftopik
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.main
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: BOT_PASSWORD
+        value: мега
+      - key: LOLZ_OFFTOP_FORUM_ID
+        value: "8"
+      - key: LOLZ_OFFTOP_URL
+        value: https://lolz.live/forums/8/
+      - key: POLL_INTERVAL_SECONDS
+        value: "25"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_OWNER_ID
+        sync: false
+      - key: LOLZ_API_TOKEN
+        sync: false

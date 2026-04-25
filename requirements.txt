@@ -1,0 +1,4 @@
+aiogram>=3.13,<4
+aiohttp>=3.10,<4
+selectolax>=0.3.27
+python-dotenv>=1.0.1
