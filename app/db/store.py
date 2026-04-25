@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS pending_actions (
     card_chat_id INTEGER NOT NULL,
     card_message_id INTEGER NOT NULL,
     payload TEXT,                -- multi-step state (e.g. title between create_title and create_body)
+    cancel_message_id INTEGER,   -- optional id of the small 'Передумал?' inline-kb message
     PRIMARY KEY (chat_id, prompt_message_id)
 );
 
@@ -82,6 +83,8 @@ class Store:
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(pending_actions)").fetchall()}
             if "payload" not in cols:
                 conn.execute("ALTER TABLE pending_actions ADD COLUMN payload TEXT")
+            if "cancel_message_id" not in cols:
+                conn.execute("ALTER TABLE pending_actions ADD COLUMN cancel_message_id INTEGER")
             cards_cols = {row["name"] for row in conn.execute("PRAGMA table_info(cards)").fetchall()}
             if "creator_user_id" not in cards_cols:
                 conn.execute("ALTER TABLE cards ADD COLUMN creator_user_id INTEGER NOT NULL DEFAULT 0")
@@ -244,6 +247,7 @@ class Store:
         card_chat_id: int,
         card_message_id: int,
         quote_post_id: int | None = None,
+        cancel_message_id: int | None = None,
     ) -> None:
         # The optional quote_post_id is stored in 'payload' as a string so the
         # submit step can prepend a [QUOTE] block when posting.
@@ -254,6 +258,7 @@ class Store:
             card_chat_id=card_chat_id,
             card_message_id=card_message_id,
             payload=str(quote_post_id) if quote_post_id else None,
+            cancel_message_id=cancel_message_id,
         )
 
     async def set_pending_edit(
@@ -263,6 +268,7 @@ class Store:
         post_id: int,
         card_chat_id: int,
         card_message_id: int,
+        cancel_message_id: int | None = None,
     ) -> None:
         await self._set_pending(
             chat_id, prompt_message_id, "edit",
@@ -271,9 +277,15 @@ class Store:
             card_chat_id=card_chat_id,
             card_message_id=card_message_id,
             payload=None,
+            cancel_message_id=cancel_message_id,
         )
 
-    async def set_pending_create_title(self, chat_id: int, prompt_message_id: int) -> None:
+    async def set_pending_create_title(
+        self,
+        chat_id: int,
+        prompt_message_id: int,
+        cancel_message_id: int | None = None,
+    ) -> None:
         await self._set_pending(
             chat_id, prompt_message_id, "create_title",
             target_thread_id=None,
@@ -281,10 +293,15 @@ class Store:
             card_chat_id=chat_id,
             card_message_id=prompt_message_id,
             payload=None,
+            cancel_message_id=cancel_message_id,
         )
 
     async def set_pending_create_body(
-        self, chat_id: int, prompt_message_id: int, title: str
+        self,
+        chat_id: int,
+        prompt_message_id: int,
+        title: str,
+        cancel_message_id: int | None = None,
     ) -> None:
         await self._set_pending(
             chat_id, prompt_message_id, "create_body",
@@ -293,6 +310,7 @@ class Store:
             card_chat_id=chat_id,
             card_message_id=prompt_message_id,
             payload=title,
+            cancel_message_id=cancel_message_id,
         )
 
     async def _set_pending(
@@ -306,18 +324,19 @@ class Store:
         card_chat_id: int,
         card_message_id: int,
         payload: str | None,
+        cancel_message_id: int | None = None,
     ) -> None:
         async with self._lock:
             with self._connect() as conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO pending_actions"
                     "(chat_id,prompt_message_id,action,target_thread_id,target_post_id,"
-                    " card_chat_id,card_message_id,payload)"
-                    " VALUES(?,?,?,?,?,?,?,?)",
+                    " card_chat_id,card_message_id,payload,cancel_message_id)"
+                    " VALUES(?,?,?,?,?,?,?,?,?)",
                     (
                         chat_id, prompt_message_id, action,
                         target_thread_id, target_post_id,
-                        card_chat_id, card_message_id, payload,
+                        card_chat_id, card_message_id, payload, cancel_message_id,
                     ),
                 )
                 conn.commit()
@@ -348,7 +367,7 @@ class Store:
         async with self._lock:
             with self._connect() as conn:
                 row = conn.execute(
-                    "SELECT action,target_thread_id,target_post_id,card_chat_id,card_message_id,payload "
+                    "SELECT action,target_thread_id,target_post_id,card_chat_id,card_message_id,payload,cancel_message_id "
                     "FROM pending_actions WHERE chat_id=? AND prompt_message_id=?",
                     (chat_id, prompt_message_id),
                 ).fetchone()

@@ -145,8 +145,12 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             "📝 Пришли заголовок темы (одной строкой):",
             reply_markup=ForceReply(input_field_placeholder="Заголовок..."),
         )
-        await store.set_pending_create_title(message.chat.id, prompt.message_id)
-        await message.answer("Передумал?", reply_markup=cancel_kb(prompt.message_id))
+        cancel_msg = await message.answer(
+            "Передумал?", reply_markup=cancel_kb(prompt.message_id)
+        )
+        await store.set_pending_create_title(
+            message.chat.id, prompt.message_id, cancel_message_id=cancel_msg.message_id
+        )
 
     # ----- inline buttons: like / reply / edit --------------------------------
 
@@ -414,6 +418,9 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             f"Можно текстом, фото, видео или гифкой (с подписью).",
             reply_markup=ForceReply(input_field_placeholder="Ответ на пост..."),
         )
+        cancel_msg = await cq.message.answer(
+            "Передумал?", reply_markup=cancel_kb(prompt.message_id)
+        )
         await store.set_pending_reply(
             cq.message.chat.id,
             prompt.message_id,
@@ -421,8 +428,8 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             card_chat_id=cq.message.chat.id,
             card_message_id=cq.message.message_id,
             quote_post_id=post_id,
+            cancel_message_id=cancel_msg.message_id,
         )
-        await cq.message.answer("Передумал?", reply_markup=cancel_kb(prompt.message_id))
         await cq.answer()
 
     @router.callback_query(F.data.startswith("reply:"))
@@ -444,14 +451,17 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             f"Можно текстом, фото, видео или гифкой (можно с подписью).",
             reply_markup=ForceReply(input_field_placeholder="Ответ в тему..."),
         )
+        cancel_msg = await cq.message.answer(
+            "Передумал?", reply_markup=cancel_kb(prompt.message_id)
+        )
         await store.set_pending_reply(
             cq.message.chat.id,
             prompt.message_id,
             thread_id,
             card_chat_id=cq.message.chat.id,
             card_message_id=cq.message.message_id,
+            cancel_message_id=cancel_msg.message_id,
         )
-        await cq.message.answer("Передумал?", reply_markup=cancel_kb(prompt.message_id))
         await cq.answer()
 
     @router.callback_query(F.data.startswith("edit:"))
@@ -473,14 +483,17 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             f"Можно текстом, фото, видео или гифкой (с подписью).",
             reply_markup=ForceReply(input_field_placeholder="Новый текст ответа..."),
         )
+        cancel_msg = await cq.message.answer(
+            "Передумал?", reply_markup=cancel_kb(prompt.message_id)
+        )
         await store.set_pending_edit(
             cq.message.chat.id,
             prompt.message_id,
             post_id,
             card_chat_id=cq.message.chat.id,
             card_message_id=cq.message.message_id,
+            cancel_message_id=cancel_msg.message_id,
         )
-        await cq.message.answer("Передумал?", reply_markup=cancel_kb(prompt.message_id))
         await cq.answer()
 
     # ----- view replies -------------------------------------------------------
@@ -546,10 +559,30 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
                 "📝 Теперь пришли текст темы (можно с фото / видео / гифкой и подписью):",
                 reply_markup=ForceReply(input_field_placeholder="Текст темы..."),
             )
-            await store.set_pending_create_body(message.chat.id, prompt.message_id, title_text)
-            await message.answer("Передумал?", reply_markup=cancel_kb(prompt.message_id))
+            cancel_msg = await message.answer(
+                "Передумал?", reply_markup=cancel_kb(prompt.message_id)
+            )
+            await store.set_pending_create_body(
+                message.chat.id, prompt.message_id, title_text,
+                cancel_message_id=cancel_msg.message_id,
+            )
+            # Drop the previous step's prompt and its cancel hint, plus the
+            # title message we just consumed.
+            prev_cancel = pending.get("cancel_message_id")
+            if prev_cancel:
+                await _safe_delete(bot, message.chat.id, int(prev_cancel))
             await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
             return
+
+        cancel_msg_id = pending.get("cancel_message_id")
+
+        async def _finalize_force_reply() -> None:
+            """Drop the prompt, the cancel hint and the user's message; reattach menu."""
+            if cancel_msg_id:
+                await _safe_delete(bot, message.chat.id, int(cancel_msg_id))
+            await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
+            await _safe_delete(bot, message.chat.id, message.message_id)
+            await _reattach_main_menu(bot, store, message.chat.id)
 
         try:
             if action == "create_body":
@@ -571,9 +604,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
                     parse_mode="HTML",
                     disable_web_page_preview=False,
                 )
-                await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
-                await _safe_delete(bot, message.chat.id, message.message_id)
-                await _reattach_main_menu(bot, store, message.chat.id)
+                await _finalize_force_reply()
                 return
             if action == "reply":
                 thread_id = int(pending["target_thread_id"])
@@ -604,10 +635,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
                     reply_text=display_text,
                     post_id=post_id,
                 )
-                # Cleanup the prompt.
-                await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
-                await _safe_delete(bot, message.chat.id, message.message_id)
-                await _reattach_main_menu(bot, store, message.chat.id)
+                await _finalize_force_reply()
             elif action == "edit":
                 post_id = int(pending["target_post_id"])
                 await lolz.edit_post(post_id, body)
@@ -621,9 +649,7 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
                     new_reply_text=display_text,
                     post_id=post_id,
                 )
-                await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
-                await _safe_delete(bot, message.chat.id, message.message_id)
-                await _reattach_main_menu(bot, store, message.chat.id)
+                await _finalize_force_reply()
         except LolzApiError as e:
             log.exception("Force-reply action failed: %s", e)
             await message.answer(f"⚠ Ошибка lolz API: {e}")
