@@ -161,6 +161,16 @@ class LolzClient:
         thread = data.get("thread") or {}
         return int(thread.get("thread_id", 0))
 
+    async def create_post_comment(self, post_id: int, body: str) -> int:
+        """Post a comment under an existing post. Returns the new comment_id."""
+        data = await self._request(
+            "POST",
+            f"/posts/{post_id}/comments",
+            data={"post_comment_body": body, "comment_body": body},
+        )
+        c = data.get("post_comment") or data.get("comment") or {}
+        return int(c.get("post_comment_id", 0) or c.get("comment_id", 0) or 0)
+
     async def edit_post(self, post_id: int, body: str) -> None:
         await self._request("PUT", f"/posts/{post_id}", data={"post_body": body})
 

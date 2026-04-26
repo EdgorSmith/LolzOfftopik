@@ -280,6 +280,25 @@ class Store:
             cancel_message_id=cancel_message_id,
         )
 
+    async def set_pending_comment_reply(
+        self,
+        chat_id: int,
+        prompt_message_id: int,
+        post_id: int,
+        cancel_message_id: int | None = None,
+    ) -> None:
+        # No card to mutate afterwards (notification messages are stand-alone),
+        # so card_chat_id/card_message_id just point at the prompt itself.
+        await self._set_pending(
+            chat_id, prompt_message_id, "comment_reply",
+            target_thread_id=None,
+            target_post_id=post_id,
+            card_chat_id=chat_id,
+            card_message_id=prompt_message_id,
+            payload=None,
+            cancel_message_id=cancel_message_id,
+        )
+
     async def set_pending_create_title(
         self,
         chat_id: int,

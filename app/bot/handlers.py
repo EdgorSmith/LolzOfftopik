@@ -386,6 +386,36 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
         except TelegramBadRequest:
             pass
 
+    @router.callback_query(F.data.startswith("creply:"))
+    async def cb_creply(cq: CallbackQuery) -> None:
+        """Reply to a post-comment notification by posting a comment under that post."""
+        if not await store.is_unlocked():
+            await cq.answer("Бот заблокирован.", show_alert=True)
+            return
+        try:
+            _, post_id_str = cq.data.split(":", 1)
+            post_id = int(post_id_str)
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        prompt = await cq.message.answer(
+            f"💬 Напиши комментарий под постом #{post_id}.",
+            reply_markup=ForceReply(input_field_placeholder="Комментарий..."),
+        )
+        cancel_msg = await cq.message.answer(
+            "Передумал?", reply_markup=cancel_kb(prompt.message_id)
+        )
+        await store.set_pending_comment_reply(
+            cq.message.chat.id,
+            prompt.message_id,
+            post_id,
+            cancel_message_id=cancel_msg.message_id,
+        )
+        await cq.answer()
+
     @router.callback_query(F.data.startswith("rreply:"))
     async def cb_rreply(cq: CallbackQuery) -> None:
         """Reply to a specific post (from the View Replies stream)."""
@@ -634,6 +664,18 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
                     thread_title=title,
                     reply_text=display_text,
                     post_id=post_id,
+                )
+                await _finalize_force_reply()
+            elif action == "comment_reply":
+                post_id = int(pending["target_post_id"])
+                comment_id = await lolz.create_post_comment(post_id, body)
+                preview_url = (
+                    f"https://lolz.live/posts/comments/{comment_id}/"
+                    if comment_id else f"https://lolz.live/posts/{post_id}/"
+                )
+                await message.answer(
+                    f"✓ Комментарий отправлен.\n{preview_url}",
+                    disable_web_page_preview=True,
                 )
                 await _finalize_force_reply()
             elif action == "edit":

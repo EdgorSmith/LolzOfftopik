@@ -14,11 +14,11 @@ import asyncio
 import html
 import logging
 import re
-from datetime import UTC, datetime
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from selectolax.parser import HTMLParser
 
 from app.config import Config
 from app.db import Store
@@ -100,9 +100,9 @@ class NotifPoller:
         for n in new_ones:
             nid = int(n.get("notification_id") or 0)
             try:
-                reason = await self._classify(n)
-                if reason is not None:
-                    await self._send_one(n, reason)
+                classified = await self._classify(n)
+                if classified is not None:
+                    await self._send_one(n, classified)
                 else:
                     log.info(
                         "Skip notification %s (%s/%s) — not for me",
@@ -112,7 +112,6 @@ class NotifPoller:
                     )
             except TelegramBadRequest as e:
                 log.warning("Failed to deliver notification %s: %s", nid, e)
-                # Don't advance the watermark — try again next tick.
                 continue
             except Exception:  # noqa: BLE001
                 log.exception("Notification %s processing failed", nid)
@@ -121,26 +120,32 @@ class NotifPoller:
                 last_seen = nid
                 await self._store.set_setting(_SETTING_KEY, str(last_seen))
 
-    async def _classify(self, n: dict) -> str | None:
-        """Decide whether a notification is relevant and label why.
+    async def _classify(self, n: dict) -> dict | None:
+        """Decide whether a notification is relevant and gather render data.
 
-        Returns one of ``"my_thread"``, ``"quote"``, ``"mention"`` (post-type
-        notifications) or ``"other"`` (non-post — always delivered). Returns
-        ``None`` when the notification should be dropped silently.
+        Returns a dict ``{reason, body, post_id}`` or ``None`` when the
+        notification should be dropped. ``reason`` is one of:
+        ``my_thread``, ``quote``, ``mention``, ``post_comment``, ``other``.
         """
         ctype = (n.get("content_type") or "").lower()
-        if ctype != "post":
-            # Profile-post / conversation / follow / etc. — keep delivering;
-            # those are always personally addressed.
-            return "other"
-
-        post_id = int(n.get("content_id") or 0)
-        if not post_id:
-            return None
+        action = (n.get("content_action") or "").lower()
         my_uid = self._store.self_user_id
         my_username = (self._store.self_username or "").lower()
-        if not my_uid:
-            return None  # /users/me not loaded yet — skip until next tick
+
+        if ctype == "post_comment" and action == "your_post":
+            # Someone commented on the user's post. The HTML preview already
+            # contains the comment body and the parent post_id; we don't need
+            # an extra API call.
+            body, post_id = _parse_comment_html(n.get("notification_html") or "", my_username)
+            return {"reason": "post_comment", "body": body, "post_id": post_id}
+
+        if ctype != "post":
+            # Profile-post / conversation / follow / etc. — always personal.
+            return {"reason": "other", "body": "", "post_id": 0}
+
+        post_id = int(n.get("content_id") or 0)
+        if not post_id or not my_uid:
+            return None
         try:
             post = await self._lolz.get_post(post_id)
         except LolzApiError as e:
@@ -148,24 +153,25 @@ class NotifPoller:
             return None
 
         if int(post.get("poster_user_id") or 0) == my_uid:
-            return None  # don't notify about my own posts
+            return None
+
+        body_bb = post.get("post_body") or ""
+        body_text = _strip_bbcode(body_bb)
 
         thread = post.get("thread") or {}
         if int(thread.get("creator_user_id") or 0) == my_uid:
-            return "my_thread"
-
-        body = post.get("post_body") or ""
-        if re.search(rf"\[QUOTE=[^\]]*member:\s*{my_uid}\b", body, re.IGNORECASE):
-            return "quote"
+            return {"reason": "my_thread", "body": body_text, "post_id": post_id}
+        if re.search(rf"\[QUOTE=[^\]]*member:\s*{my_uid}\b", body_bb, re.IGNORECASE):
+            return {"reason": "quote", "body": body_text, "post_id": post_id}
         if my_username and re.search(
-            rf"@(?:\[user=\d+\])?{re.escape(my_username)}\b", body, re.IGNORECASE
+            rf"@(?:\[user=\d+\])?{re.escape(my_username)}\b", body_bb, re.IGNORECASE
         ):
-            return "mention"
+            return {"reason": "mention", "body": body_text, "post_id": post_id}
         return None
 
-    async def _send_one(self, n: dict, reason: str) -> None:
-        text = _format(n, reason)
-        kb = _kb_for(n)
+    async def _send_one(self, n: dict, classified: dict) -> None:
+        text = _format(n, classified)
+        kb = _kb_for(n, classified)
         await self._bot.send_message(
             self._config.telegram_owner_id,
             text,
@@ -180,13 +186,24 @@ class NotifPoller:
 # ---------------------------------------------------------------------------
 
 
-def _kb_for(n: dict) -> InlineKeyboardMarkup | None:
+def _kb_for(n: dict, classified: dict) -> InlineKeyboardMarkup | None:
+    rows: list[list[InlineKeyboardButton]] = []
+    reason = classified.get("reason")
+    post_id = int(classified.get("post_id") or 0)
+
+    if reason == "post_comment" and post_id:
+        rows.append([
+            InlineKeyboardButton(text="↩ Ответить", callback_data=f"creply:{post_id}"),
+            InlineKeyboardButton(text="🌐 Открыть",
+                                 url=f"https://lolz.live/posts/{post_id}/"),
+        ])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
     url = _link_for(n)
     if not url:
         return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🌐 Открыть", url=url)]]
-    )
+    rows.append([InlineKeyboardButton(text="🌐 Открыть", url=url)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _link_for(n: dict) -> str:
@@ -203,14 +220,16 @@ def _link_for(n: dict) -> str:
     return ""
 
 
-def _format(n: dict, reason: str) -> str:
+def _format(n: dict, classified: dict) -> str:
     """Render a single notification as a TG HTML message."""
     creator = html.escape(str(n.get("creator_username") or "?"))
-    when = _fmt_ts(int(n.get("notification_create_date") or 0))
-    icon, action = _label(n, reason)
+    icon, action = _label(n, classified["reason"])
+    body = (classified.get("body") or "").strip()
     head = f"{icon} <b>{creator}</b> {action}"
-    tail = f"\n<i>{when}</i>"
-    return head + tail
+    if body:
+        snippet = body if len(body) <= 600 else body[:600].rstrip() + "…"
+        return f"{head}\n\n<i>{html.escape(snippet)}</i>"
+    return head
 
 
 def _label(n: dict, reason: str) -> tuple[str, str]:
@@ -221,6 +240,8 @@ def _label(n: dict, reason: str) -> tuple[str, str]:
         return "↩", "ответил на твой пост"
     if reason == "mention":
         return "📣", "упомянул тебя"
+    if reason == "post_comment":
+        return "💬", "прокомментировал твой пост"
 
     # reason == "other" — non-post notifications, fall back to type/action.
     ctype = (n.get("content_type") or "").lower()
@@ -234,7 +255,40 @@ def _label(n: dict, reason: str) -> tuple[str, str]:
     return "🔔", f"{ctype}/{action}".strip("/")
 
 
-def _fmt_ts(ts: int) -> str:
-    if not ts:
-        return "—"
-    return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+_BBCODE_TAG_RE = re.compile(r"\[/?[A-Za-z][^\]]*\]")
+
+
+def _strip_bbcode(s: str) -> str:
+    """Best-effort strip of BBCode for a short preview snippet."""
+    s = _BBCODE_TAG_RE.sub(" ", s or "")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _parse_comment_html(notif_html: str, my_username: str) -> tuple[str, int]:
+    """Pull the comment body and parent post_id out of ``notification_html``.
+
+    Lolz includes a ready-to-render snippet that already contains the comment
+    text after a ``<br>`` tag, plus a ``/posts/{post_id}/preview`` link. We
+    parse both with selectolax and fall back to regex on the raw HTML.
+    """
+    if not notif_html:
+        return "", 0
+
+    # Parent post_id from /posts/<id>/preview link.
+    m = re.search(r"/posts/(\d+)/preview", notif_html)
+    post_id = int(m.group(1)) if m else 0
+
+    # The comment body is the part after the first <br>.
+    parts = re.split(r"<br\s*/?>", notif_html, maxsplit=1)
+    raw_body = parts[1] if len(parts) > 1 else notif_html
+    text = HTMLParser(raw_body).text(separator="").strip()
+
+    # Drop our own @-mention prefix ("MyNick, ...").
+    if my_username:
+        prefix = re.match(
+            rf"^@?{re.escape(my_username)}\s*,\s*", text, re.IGNORECASE
+        )
+        if prefix:
+            text = text[prefix.end():]
+    return text, post_id
