@@ -78,34 +78,55 @@ async def learn_user_replies(
             reason = "error"
             break
 
-        contents = data.get("contents") or data.get("timeline") or []
-        if not contents:
+        # The Lolz timeline API returns: { "data": [...], "data_total": N,
+        # "user": {...}, "links": {...}, "system_info": {...} }
+        # Each item is FLAT: it has top-level `content_type`, `post_body`,
+        # `post_body_plain_text`, `post_create_date`, `post_id`, `thread_id`,
+        # plus a nested `thread` object that carries `forum_id` and
+        # `thread_title`. The previous parser looked for `data["contents"]`
+        # and a non-existent `item["content"]` — both wrong, which is why
+        # /learn_replies stopped at "0 pages, 0 posts" on page 1.
+        items = data.get("data") or data.get("contents") or data.get("timeline") or []
+        if not items:
             reason = "empty"
             break
         pages += 1
 
         page_saved = 0
-        for item in contents:
+        for item in items:
             ctype = (item.get("content_type") or "").lower()
+            # Only count actual replies. Self-created threads also appear in
+            # the timeline but have no `post_body`.
             if ctype != "post":
                 continue
             seen += 1
-            content = item.get("content") or item.get("post") or {}
-            thread = content.get("thread") or {}
-            if int(thread.get("forum_id", 0) or 0) != int(forum_id):
+            # For 'post' items, `forum_id` lives in the nested `thread` object,
+            # not at top level (top-level `forum_id` exists only for 'thread'
+            # items). The nested `thread` also carries `thread_title`.
+            thread_obj = item.get("thread") or {}
+            item_forum_id = (
+                int(thread_obj.get("forum_id") or 0)
+                or int(item.get("forum_id") or 0)
+            )
+            if item_forum_id != int(forum_id):
                 continue
             body_plain = (
-                content.get("post_body_plain_text")
-                or _clean_body(content.get("post_body") or "")
+                item.get("post_body_plain_text")
+                or _clean_body(item.get("post_body") or "")
             ).strip()
             if not body_plain or len(body_plain) < 3:
                 continue
+            thread_title = (
+                thread_obj.get("thread_title")
+                or item.get("thread_title")
+                or ""
+            )
             await store.upsert_my_reply(
-                post_id=int(content.get("post_id") or 0),
-                thread_id=int(thread.get("thread_id") or 0),
-                thread_title=str(thread.get("thread_title") or "")[:200],
+                post_id=int(item.get("post_id") or item.get("content_id") or 0),
+                thread_id=int(item.get("thread_id") or thread_obj.get("thread_id") or 0),
+                thread_title=str(thread_title)[:200],
                 body_plain=body_plain[:1000],
-                posted_at=int(content.get("post_create_date") or 0),
+                posted_at=int(item.get("post_create_date") or 0),
             )
             page_saved += 1
 
