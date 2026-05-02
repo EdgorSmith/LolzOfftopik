@@ -7,15 +7,32 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardBu
 START_BUTTON_TEXT = "▶ Начать оффтопить"
 STOP_BUTTON_TEXT = "⏹ Окончить оффтоп"
 CREATE_THREAD_BUTTON_TEXT = "📝 Создать тему"
+AI_ON_BUTTON_TEXT = "🤖 Нейросеть: вкл"
+AI_OFF_BUTTON_TEXT = "🤖 Нейросеть: выкл"
+# Either label triggers the toggle handler.
+AI_TOGGLE_BUTTON_TEXTS = (AI_ON_BUTTON_TEXT, AI_OFF_BUTTON_TEXT)
 
 
-def main_menu(polling_enabled: bool) -> ReplyKeyboardMarkup:
-    label = STOP_BUTTON_TEXT if polling_enabled else START_BUTTON_TEXT
+def main_menu(
+    polling_enabled: bool,
+    *,
+    ai_available: bool = False,
+    ai_enabled: bool = False,
+) -> ReplyKeyboardMarkup:
+    """Bottom reply keyboard.
+
+    The AI row is rendered only when ``ai_available`` is true (i.e. a Gemini
+    key is configured). Without a key the row is hidden so the user doesn't see
+    a button that does nothing.
+    """
+    poll_label = STOP_BUTTON_TEXT if polling_enabled else START_BUTTON_TEXT
+    ai_label = AI_ON_BUTTON_TEXT if ai_enabled else AI_OFF_BUTTON_TEXT
+    rows = [[KeyboardButton(text=poll_label)]]
+    if ai_available:
+        rows.append([KeyboardButton(text=ai_label)])
+    rows.append([KeyboardButton(text=CREATE_THREAD_BUTTON_TEXT)])
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=label)],
-            [KeyboardButton(text=CREATE_THREAD_BUTTON_TEXT)],
-        ],
+        keyboard=rows,
         resize_keyboard=True,
         one_time_keyboard=False,
     )
