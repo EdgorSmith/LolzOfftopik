@@ -29,6 +29,7 @@ from app.bot.cards import (
 from app.bot.keyboards import (
     AI_TOGGLE_BUTTON_TEXTS,
     CREATE_THREAD_BUTTON_TEXT,
+    HELP_BUTTON_TEXT,
     START_BUTTON_TEXT,
     STOP_BUTTON_TEXT,
     cancel_kb,
@@ -92,8 +93,36 @@ def build_router(
             "🔒 Заблокировано. Введи пароль, чтобы продолжить.", reply_markup=ReplyKeyboardRemove()
         )
 
-    # Plain text (NOT a ForceReply response) — password gate or main menu actions.
-    @router.message(F.text, F.reply_to_message.is_(None))
+    @router.message(Command("help", "commands"))
+    async def cmd_help(message: Message) -> None:
+        if not await store.is_unlocked():
+            return
+        await message.answer(_help_text(suggester is not None and suggester.configured), parse_mode="HTML")
+
+    @router.message(Command("offtop_on"))
+    async def cmd_offtop_on(message: Message, bot: Bot) -> None:
+        if not await store.is_unlocked():
+            return
+        await _start_polling(message, bot)
+
+    @router.message(Command("offtop_off"))
+    async def cmd_offtop_off(message: Message) -> None:
+        if not await store.is_unlocked():
+            return
+        await _stop_polling(message)
+
+    @router.message(Command("new_thread"))
+    async def cmd_new_thread(message: Message) -> None:
+        if not await store.is_unlocked():
+            return
+        await _begin_create_thread(message)
+
+    # Plain text (NOT a ForceReply response, NOT a slash-command) — password gate
+    # or main-menu reply-keyboard buttons. Slash-commands are intentionally
+    # excluded here so they fall through to their dedicated Command() handlers
+    # below; otherwise this catch-all would swallow /ai_status, /learn_replies,
+    # etc. and they would never fire.
+    @router.message(F.text, F.reply_to_message.is_(None), ~F.text.startswith("/"))
     async def handle_text(message: Message, bot: Bot) -> None:
         # Locked state — accept password only.
         if not await store.is_unlocked():
@@ -107,23 +136,29 @@ def build_router(
             return
 
         text = (message.text or "").strip()
-        if text in (START_BUTTON_TEXT, "/offtop_on"):
+        if text == START_BUTTON_TEXT:
             await _start_polling(message, bot)
             return
-        if text in (STOP_BUTTON_TEXT, "/offtop_off"):
+        if text == STOP_BUTTON_TEXT:
             await _stop_polling(message)
             return
-        if text in (CREATE_THREAD_BUTTON_TEXT, "/new_thread"):
+        if text == CREATE_THREAD_BUTTON_TEXT:
             await _begin_create_thread(message)
             return
         if text in AI_TOGGLE_BUTTON_TEXTS:
             await _toggle_ai(message)
             return
+        if text == HELP_BUTTON_TEXT:
+            await message.answer(
+                _help_text(suggester is not None and suggester.configured),
+                parse_mode="HTML",
+            )
+            return
 
         # Otherwise — show the menu.
         polling = await store.is_polling_enabled()
         await message.answer(
-            "Используй кнопку ниже, чтобы включить/выключить оффтоп.",
+            "Не понял. Жми «❓ Команды» или /help.",
             reply_markup=await _menu(polling),
         )
 
@@ -1060,6 +1095,43 @@ async def _reattach_main_menu(
         )
     except TelegramBadRequest as e:
         log.warning("reattach main menu failed: %s", e)
+
+
+def _help_text(ai_available: bool) -> str:
+    """Pretty-printed list of all bot commands."""
+    lines: list[str] = [
+        "<b>Команды</b>",
+        "",
+        "<b>Базовые</b>",
+        "  /start — поприветствовать, показать клавиатуру",
+        "  /help, /commands — этот список",
+        "  /lock — заблокировать бота (нужен пароль для разблока)",
+        "",
+        "<b>Оффтоп-поллер</b>",
+        "  /offtop_on — слежу за новыми темами в оффтопе",
+        "  /offtop_off — приостановить",
+        "  /new_thread — создать тему (запросит заголовок)",
+    ]
+    if ai_available:
+        lines += [
+            "",
+            "<b>AI-черновики</b> (Gemini)",
+            "  /ai_on, /ai_off — включить/выключить",
+            "  /ai_status — состояние, модель, сколько реплик выучено",
+            "  /learn_replies [pages] [target] — спарсить старые ответы для стиля",
+            "      пример: <code>/learn_replies 50 500</code>",
+        ]
+    else:
+        lines += [
+            "",
+            "<i>AI-черновики выключены: не задан GEMINI_API_KEY.</i>",
+        ]
+    lines += [
+        "",
+        "<b>Кнопки</b>",
+        "  ▶/⏹ Оффтопить · 🤖 Нейросеть · 📝 Создать тему · ❓ Команды",
+    ]
+    return "\n".join(lines)
 
 
 def _media_kind_label(message: Message) -> str:
