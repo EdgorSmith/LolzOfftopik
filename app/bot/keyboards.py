@@ -9,6 +9,7 @@ STOP_BUTTON_TEXT = "⏹ Окончить оффтоп"
 CREATE_THREAD_BUTTON_TEXT = "📝 Создать тему"
 AI_ON_BUTTON_TEXT = "🤖 Нейросеть: вкл"
 AI_OFF_BUTTON_TEXT = "🤖 Нейросеть: выкл"
+HELP_BUTTON_TEXT = "❓ Команды"
 # Either label triggers the toggle handler.
 AI_TOGGLE_BUTTON_TEXTS = (AI_ON_BUTTON_TEXT, AI_OFF_BUTTON_TEXT)
 
@@ -30,7 +31,10 @@ def main_menu(
     rows = [[KeyboardButton(text=poll_label)]]
     if ai_available:
         rows.append([KeyboardButton(text=ai_label)])
-    rows.append([KeyboardButton(text=CREATE_THREAD_BUTTON_TEXT)])
+    rows.append([
+        KeyboardButton(text=CREATE_THREAD_BUTTON_TEXT),
+        KeyboardButton(text=HELP_BUTTON_TEXT),
+    ])
     return ReplyKeyboardMarkup(
         keyboard=rows,
         resize_keyboard=True,

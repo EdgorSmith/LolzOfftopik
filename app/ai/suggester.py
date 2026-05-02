@@ -117,8 +117,16 @@ class AISuggester:
                 draft = await self._generate(thread)
             except GeminiError as e:
                 log.warning("ai draft failed for %s: %s", thread.thread_id, e)
+                # Surface the failure under the card so the user knows AI tried
+                # but couldn't (most common case: 429 quota or 5xx).
+                await self._send_error_under_card(
+                    chat_id, card_message_id, _format_gemini_error(e)
+                )
                 return
             if not draft:
+                await self._send_error_under_card(
+                    chat_id, card_message_id, "🤖 Gemini вернул пустой ответ."
+                )
                 return
             try:
                 msg = await self._bot.send_message(
@@ -143,6 +151,21 @@ class AISuggester:
             )
         finally:
             self._inflight.discard(thread.thread_id)
+
+    async def _send_error_under_card(
+        self, chat_id: int, card_message_id: int, text: str
+    ) -> None:
+        try:
+            await self._bot.send_message(
+                chat_id,
+                text,
+                parse_mode="HTML",
+                reply_to_message_id=card_message_id,
+                allow_sending_without_reply=True,
+                disable_web_page_preview=True,
+            )
+        except TelegramBadRequest as e:
+            log.warning("send ai-error failed: %s", e)
 
     # ---- regeneration (called from the 'другой вариант' button) -------------
 
@@ -214,6 +237,26 @@ def _build_prompt(title: str, body: str, examples: list[str]) -> str:
     parts.append("")
     parts.append("Сгенерируй один ответ в духе моих примеров.")
     return "\n".join(parts)
+
+
+def _format_gemini_error(e: GeminiError) -> str:
+    """Translate the underlying GeminiError into a short Russian status line."""
+    if e.status == 429:
+        return (
+            "🤖 Gemini: лимит исчерпан (429). На бесплатном тарифе "
+            "это ~10–15 запросов/мин и ~250–1500/день. Попробуй позже "
+            "или сменить модель через GEMINI_MODEL (например, "
+            "<code>gemini-2.0-flash-lite</code>)."
+        )
+    if e.status >= 500:
+        return f"🤖 Gemini временно недоступен ({e.status}). Попробую под следующей темой."
+    if e.status in (401, 403):
+        return "🤖 Gemini: ключ невалиден или нет доступа к модели."
+    if e.status == 0:
+        return "🤖 Gemini: сетевой сбой при запросе."
+    # Trim long error bodies.
+    snippet = (str(e) or "").splitlines()[0][:200]
+    return f"🤖 Gemini ошибка ({e.status}): {snippet}"
 
 
 def _postprocess(text: str) -> str:
