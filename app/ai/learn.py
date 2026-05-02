@@ -95,42 +95,82 @@ async def learn_user_replies(
         page_saved = 0
         for item in items:
             ctype = (item.get("content_type") or "").lower()
-            # Only count actual replies. Self-created threads also appear in
-            # the timeline but have no `post_body`.
-            if ctype != "post":
+            # Two style sources are useful: 'post' items (replies you wrote)
+            # AND 'thread' items (the first post of threads YOU created — the
+            # body is in item.first_post). Including both ~doubles the sample
+            # pool because the Lolz timeline/search API hard-caps the index
+            # to ~180 items per user, and skipping threads loses about a
+            # third of that.
+            if ctype == "post":
+                # For 'post' items, `forum_id` lives in the nested `thread`
+                # object, not at top level (top-level `forum_id` exists only
+                # for 'thread' items). The nested `thread` also carries
+                # `thread_title`.
+                thread_obj = item.get("thread") or {}
+                item_forum_id = (
+                    int(thread_obj.get("forum_id") or 0)
+                    or int(item.get("forum_id") or 0)
+                )
+                if item_forum_id != int(forum_id):
+                    continue
+                seen += 1
+                body_plain = (
+                    item.get("post_body_plain_text")
+                    or _clean_body(item.get("post_body") or "")
+                ).strip()
+                post_id_v = int(item.get("post_id") or item.get("content_id") or 0)
+                thread_id_v = int(
+                    item.get("thread_id") or thread_obj.get("thread_id") or 0
+                )
+                thread_title = (
+                    thread_obj.get("thread_title")
+                    or item.get("thread_title")
+                    or ""
+                )
+                posted_at = int(item.get("post_create_date") or 0)
+            elif ctype == "thread":
+                # Top-level `forum_id` exists for thread items.
+                if int(item.get("forum_id") or 0) != int(forum_id):
+                    continue
+                first_post = item.get("first_post") or {}
+                # Skip if the thread's first post wasn't authored by this
+                # user (e.g. timeline can include threads they posted IN).
+                if user_id and int(first_post.get("poster_user_id") or 0) != int(user_id):
+                    continue
+                seen += 1
+                body_plain = (
+                    first_post.get("post_body_plain_text")
+                    or _clean_body(first_post.get("post_body") or "")
+                ).strip()
+                post_id_v = int(first_post.get("post_id") or 0)
+                thread_id_v = int(item.get("thread_id") or 0)
+                thread_title = item.get("thread_title") or ""
+                posted_at = int(
+                    first_post.get("post_create_date")
+                    or item.get("thread_create_date")
+                    or 0
+                )
+            else:
                 continue
-            seen += 1
-            # For 'post' items, `forum_id` lives in the nested `thread` object,
-            # not at top level (top-level `forum_id` exists only for 'thread'
-            # items). The nested `thread` also carries `thread_title`.
-            thread_obj = item.get("thread") or {}
-            item_forum_id = (
-                int(thread_obj.get("forum_id") or 0)
-                or int(item.get("forum_id") or 0)
-            )
-            if item_forum_id != int(forum_id):
-                continue
-            body_plain = (
-                item.get("post_body_plain_text")
-                or _clean_body(item.get("post_body") or "")
-            ).strip()
             if not body_plain or len(body_plain) < 3:
                 continue
-            thread_title = (
-                thread_obj.get("thread_title")
-                or item.get("thread_title")
-                or ""
-            )
+            if not post_id_v:
+                continue
             await store.upsert_my_reply(
-                post_id=int(item.get("post_id") or item.get("content_id") or 0),
-                thread_id=int(item.get("thread_id") or thread_obj.get("thread_id") or 0),
+                post_id=post_id_v,
+                thread_id=thread_id_v,
                 thread_title=str(thread_title)[:200],
                 body_plain=body_plain[:1000],
-                posted_at=int(item.get("post_create_date") or 0),
+                posted_at=posted_at,
             )
             page_saved += 1
 
-        saved_total = await store.count_my_replies()
+        # Track the running total locally rather than re-querying the DB
+        # after each page. The DB count is correct but the previous version
+        # appeared to report the same final value on every progress message
+        # (likely Telegram message reordering on rapid bursts), which made
+        # the progress bar useless. Local accumulation is also faster.
+        saved_total += page_saved
         if on_progress:
             try:
                 await on_progress(
@@ -142,6 +182,10 @@ async def learn_user_replies(
         if saved_total - saved_start >= target_count:
             reason = "cap"
             break
+
+    # Reconcile with the DB once at the end (page_saved counts upserts but
+    # INSERT OR REPLACE may have updated rows that already existed).
+    saved_total = await store.count_my_replies()
 
     return LearnResult(
         pages_scanned=pages,
