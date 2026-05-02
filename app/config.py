@@ -36,6 +36,13 @@ class Config:
     gemini_api_key: str
     gemini_model: str
     ai_reply_enabled_default: bool
+    # Browser-fingerprinted "view" mode — hits HTML thread pages on lolz.live
+    # with the user's session cookies, so XenForo's "members currently
+    # viewing this thread" widget shows them as present. Disabled if any of
+    # the three is empty.
+    lolz_web_base: str
+    lolz_xf_user_cookie: str
+    lolz_xf_session_cookie: str
 
     @classmethod
     def from_env(cls) -> Config:
@@ -60,6 +67,9 @@ class Config:
             gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip(),
             gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip(),
             ai_reply_enabled_default=_truthy(os.environ.get("AI_REPLY_ENABLED")),
+            lolz_web_base=os.environ.get("LOLZ_WEB_BASE", "https://lolz.live").rstrip("/"),
+            lolz_xf_user_cookie=os.environ.get("LOLZ_XF_USER_COOKIE", "").strip(),
+            lolz_xf_session_cookie=os.environ.get("LOLZ_XF_SESSION_COOKIE", "").strip(),
         )
 
 

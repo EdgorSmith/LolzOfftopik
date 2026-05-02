@@ -30,3 +30,9 @@ services:
         value: gemini-2.0-flash
       - key: AI_REPLY_ENABLED
         value: "0"
+      - key: LOLZ_WEB_BASE
+        value: https://lolz.live
+      - key: LOLZ_XF_USER_COOKIE
+        sync: false
+      - key: LOLZ_XF_SESSION_COOKIE
+        sync: false
