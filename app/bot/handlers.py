@@ -27,6 +27,7 @@ from app.bot.cards import (
     update_replied_card_text,
 )
 from app.bot.keyboards import (
+    AI_TOGGLE_BUTTON_TEXTS,
     CREATE_THREAD_BUTTON_TEXT,
     START_BUTTON_TEXT,
     STOP_BUTTON_TEXT,
@@ -80,7 +81,7 @@ def build_router(
         polling = await store.is_polling_enabled()
         await message.answer(
             "Привет. Готов оффтопить.",
-            reply_markup=main_menu(polling),
+            reply_markup=await _menu(polling),
         )
 
     @router.message(Command("lock"))
@@ -100,7 +101,7 @@ def build_router(
                 await store.set_unlocked(True)
                 await message.answer(
                     "✅ Разблокировано. Жми «Начать оффтопить», когда будешь готов.",
-                    reply_markup=main_menu(False),
+                    reply_markup=await _menu(False),
                 )
             # Wrong password: stay silent.
             return
@@ -115,12 +116,15 @@ def build_router(
         if text in (CREATE_THREAD_BUTTON_TEXT, "/new_thread"):
             await _begin_create_thread(message)
             return
+        if text in AI_TOGGLE_BUTTON_TEXTS:
+            await _toggle_ai(message)
+            return
 
         # Otherwise — show the menu.
         polling = await store.is_polling_enabled()
         await message.answer(
             "Используй кнопку ниже, чтобы включить/выключить оффтоп.",
-            reply_markup=main_menu(polling),
+            reply_markup=await _menu(polling),
         )
 
     # ----- start / stop polling -----------------------------------------------
@@ -141,14 +145,36 @@ def build_router(
         await message.answer(
             f"▶ Оффтопим. Слежу за новыми темами в "
             f"{hd.link('разделе', config.lolz_offtop_url)} (после thread_id={baseline}).",
-            reply_markup=main_menu(True),
+            reply_markup=await _menu(True),
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
 
     async def _stop_polling(message: Message) -> None:
         await store.set_polling_enabled(False)
-        await message.answer("⏹ Оффтоп остановлен.", reply_markup=main_menu(False))
+        await message.answer("⏹ Оффтоп остановлен.", reply_markup=await _menu(False))
+
+    async def _toggle_ai(message: Message) -> None:
+        if not suggester or not suggester.configured:
+            await message.answer(
+                "⚠ Gemini не настроен (нет GEMINI_API_KEY). Кнопка ничего не делает."
+            )
+            return
+        new_state = not await suggester.is_enabled()
+        await suggester.set_enabled(new_state)
+        polling = await store.is_polling_enabled()
+        await message.answer(
+            "🤖 Нейросеть включена. Под каждой новой темой будет приходить черновик ответа + кнопки."
+            if new_state
+            else "🤖 Нейросеть выключена. Черновики больше не приходят.",
+            reply_markup=await _menu(polling),
+        )
+
+    async def _menu(polling: bool):
+        """Build the bottom keyboard, hiding the AI row when no key is set."""
+        ai_available = bool(suggester and suggester.configured)
+        ai_enabled = await suggester.is_enabled() if ai_available else False
+        return main_menu(polling, ai_available=ai_available, ai_enabled=ai_enabled)
 
     async def _begin_create_thread(message: Message) -> None:
         prompt = await message.answer(
@@ -238,7 +264,7 @@ def build_router(
         await _safe_delete(bot, cq.message.chat.id, prompt_msg_id)
         await _safe_delete(bot, cq.message.chat.id, cq.message.message_id)
         await cq.answer("❌ Отменено")
-        await _reattach_main_menu(bot, store, cq.message.chat.id)
+        await _reattach_main_menu(bot, store, cq.message.chat.id, suggester=suggester)
 
     # ----- profile / delete buttons -------------------------------------------
 
@@ -835,7 +861,7 @@ def build_router(
                 await _safe_delete(bot, message.chat.id, int(cancel_msg_id))
             await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
             await _safe_delete(bot, message.chat.id, message.message_id)
-            await _reattach_main_menu(bot, store, message.chat.id)
+            await _reattach_main_menu(bot, store, message.chat.id, suggester=suggester)
 
         try:
             if action == "create_body":
@@ -1015,11 +1041,23 @@ def _format_profile(user: dict) -> tuple[str, str | None]:
     return "\n".join(lines), (avatar or None)
 
 
-async def _reattach_main_menu(bot: Bot, store: Store, chat_id: int) -> None:
+async def _reattach_main_menu(
+    bot: Bot,
+    store: Store,
+    chat_id: int,
+    *,
+    suggester: AISuggester | None = None,
+) -> None:
     """Send a tiny confirmation that re-attaches the persistent reply keyboard."""
     polling = await store.is_polling_enabled()
+    ai_available = bool(suggester and suggester.configured)
+    ai_enabled = await suggester.is_enabled() if ai_available else False
     try:
-        await bot.send_message(chat_id, "✅ Готово.", reply_markup=main_menu(polling))
+        await bot.send_message(
+            chat_id,
+            "✅ Готово.",
+            reply_markup=main_menu(polling, ai_available=ai_available, ai_enabled=ai_enabled),
+        )
     except TelegramBadRequest as e:
         log.warning("reattach main menu failed: %s", e)
 
