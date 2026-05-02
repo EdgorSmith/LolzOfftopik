@@ -208,6 +208,24 @@ class LolzClient:
         data = await self._request("GET", f"/users/{user_id}")
         return data.get("user") or {}
 
+    async def list_user_timeline(
+        self,
+        user_id: int,
+        *,
+        page: int = 1,
+        limit: int = 20,
+    ) -> dict:
+        """Paginated content stream for a user (posts, threads, profile-posts).
+
+        Returns the raw API payload so callers can inspect ``contents`` and
+        ``links`` (for pagination).
+        """
+        return await self._request(
+            "GET",
+            f"/users/{user_id}/timeline",
+            params={"page": page, "limit": limit},
+        )
+
 
 class LolzApiError(RuntimeError):
     def __init__(self, status: int, body: str) -> None:

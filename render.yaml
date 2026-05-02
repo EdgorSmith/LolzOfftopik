@@ -24,3 +24,9 @@ services:
         sync: false
       - key: LOLZ_API_TOKEN
         sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
+      - key: AI_REPLY_ENABLED
+        value: "0"

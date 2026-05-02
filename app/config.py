@@ -31,6 +31,11 @@ class Config:
     http_port: int
     db_path: str
     public_url: str  # e.g. "https://lolzofftopik.onrender.com" — used to host attachments for replies
+    # AI draft-reply settings (optional). When gemini_api_key is empty, the
+    # feature is fully disabled regardless of ai_reply_enabled.
+    gemini_api_key: str
+    gemini_model: str
+    ai_reply_enabled_default: bool
 
     @classmethod
     def from_env(cls) -> Config:
@@ -52,4 +57,11 @@ class Config:
             http_port=int(os.environ.get("PORT", "10000")),
             db_path=os.environ.get("DB_PATH", "data/state.sqlite3"),
             public_url=public_url,
+            gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip(),
+            gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip(),
+            ai_reply_enabled_default=_truthy(os.environ.get("AI_REPLY_ENABLED")),
         )
+
+
+def _truthy(v: str | None) -> bool:
+    return (v or "").strip().lower() in {"1", "true", "yes", "on"}

@@ -10,6 +10,7 @@ import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 
+from app.ai import AISuggester, GeminiClient
 from app.bot.handlers import build_router
 from app.config import Config
 from app.db import Store
@@ -49,9 +50,15 @@ async def amain() -> None:
         default=DefaultBotProperties(parse_mode="HTML"),
     )
     dp = Dispatcher()
-    dp.include_router(build_router(config, store, lolz))
 
-    poller = Poller(config, store, lolz, bot)
+    gemini: GeminiClient | None = None
+    if config.gemini_api_key:
+        gemini = GeminiClient(config.gemini_api_key, model=config.gemini_model)
+    suggester = AISuggester(config, store, bot, client=gemini)
+
+    dp.include_router(build_router(config, store, lolz, suggester))
+
+    poller = Poller(config, store, lolz, bot, suggester=suggester)
     poller.start()
 
     notif_poller = NotifPoller(config, store, lolz, bot)
@@ -87,6 +94,7 @@ async def amain() -> None:
             pass
         await poller.stop()
         await notif_poller.stop()
+        await suggester.close()
         await lolz.close()
         await bot.session.close()
         await http_runner.cleanup()

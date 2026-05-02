@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC
 
@@ -16,6 +17,10 @@ from aiogram.types import (
 )
 from aiogram.utils.text_decorations import html_decoration as hd
 
+from app.ai import AISuggester
+from app.ai.gemini import GeminiError
+from app.ai.learn import learn_user_replies
+from app.ai.suggester import draft_kb, format_draft
 from app.bot.cards import (
     send_replies,
     transition_card_to_replied,
@@ -39,7 +44,12 @@ from app.lolz.client import LolzApiError
 log = logging.getLogger(__name__)
 
 
-def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
+def build_router(
+    config: Config,
+    store: Store,
+    lolz: LolzClient,
+    suggester: AISuggester | None = None,
+) -> Router:
     router = Router(name="lolzofftopik")
 
     def is_owner(message_or_cq) -> bool:
@@ -434,11 +444,10 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
         # Need to know which thread this post belongs to so the reply lands in
         # the right place. We fetch it from the API on demand.
         try:
-            post_data = await lolz._request("GET", f"/posts/{post_id}")
+            post = await lolz.get_post(post_id)
         except LolzApiError as e:
             await cq.answer(f"Ошибка: {e}", show_alert=True)
             return
-        post = post_data.get("post") or {}
         thread_id = int(post.get("thread_id", 0) or 0)
         if not thread_id:
             await cq.answer("Не удалось определить тему.", show_alert=True)
@@ -555,6 +564,220 @@ def build_router(config: Config, store: Store, lolz: LolzClient) -> Router:
             await cq.message.answer(f"⚠ Не удалось получить ответы: {e}")
             return
         await send_replies(bot, cq.message.chat.id, thread_id, posts, first_post_id=first_post_id)
+
+    # ----- AI draft replies (aiok / aire / aino) ------------------------------
+
+    @router.callback_query(F.data == "aiok")
+    async def cb_ai_ok(cq: CallbackQuery, bot: Bot) -> None:
+        if not await store.is_unlocked():
+            await cq.answer("Бот заблокирован.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        rec = await store.get_ai_suggestion(cq.message.chat.id, cq.message.message_id)
+        if not rec:
+            await cq.answer("Черновик уже не висит.", show_alert=True)
+            return
+        thread_id = int(rec["thread_id"])
+        body = (rec["suggestion_text"] or "").strip()
+        if not body:
+            await cq.answer("Пустой черновик.", show_alert=True)
+            return
+        try:
+            post_id = await lolz.reply(thread_id, body)
+        except LolzApiError as e:
+            log.warning("ai reply submit failed: %s", e)
+            await cq.answer(f"Ошибка: {e}", show_alert=True)
+            return
+        if not post_id:
+            await cq.answer("API не вернул post_id.", show_alert=True)
+            return
+
+        # Promote the original card to "Ответил…" — same flow as a manual reply.
+        try:
+            t = await lolz.get_thread(thread_id)
+            title = t.title
+        except LolzApiError:
+            title = ""
+        card = await store.get_card(rec["card_chat_id"], rec["card_message_id"])
+        is_photo_card = bool(card.is_photo_card) if card else False
+        try:
+            await transition_card_to_replied(
+                bot,
+                store,
+                chat_id=rec["card_chat_id"],
+                card_message_id=rec["card_message_id"],
+                is_photo_card=is_photo_card,
+                thread_id=thread_id,
+                thread_title=title,
+                reply_text=body,
+                post_id=post_id,
+            )
+        except TelegramBadRequest as e:
+            log.warning("transition_card_to_replied failed: %s", e)
+
+        await store.delete_ai_suggestion(cq.message.chat.id, cq.message.message_id)
+        await _safe_delete(bot, cq.message.chat.id, cq.message.message_id)
+        await cq.answer("✅ Отправлено")
+
+    @router.callback_query(F.data == "aire")
+    async def cb_ai_regen(cq: CallbackQuery, bot: Bot) -> None:
+        if not await store.is_unlocked():
+            await cq.answer("Бот заблокирован.", show_alert=True)
+            return
+        if not suggester or not suggester.configured:
+            await cq.answer("AI не настроен.", show_alert=True)
+            return
+        if not await suggester.is_enabled():
+            await cq.answer("AI выключен (/ai_on).", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        rec = await store.get_ai_suggestion(cq.message.chat.id, cq.message.message_id)
+        if not rec:
+            await cq.answer("Черновик уже не висит.", show_alert=True)
+            return
+        thread_id = int(rec["thread_id"])
+        await cq.answer("🔄 Генерирую другой вариант…")
+        try:
+            t = await lolz.get_thread(thread_id)
+        except LolzApiError as e:
+            await cq.message.answer(f"⚠ Не удалось получить тему: {e}")
+            return
+        body_text = (
+            t.first_post_body_plain
+            or t.first_post_body
+            or ""
+        ).strip()
+        try:
+            new_text = await suggester.regenerate(t.title, body_text)
+        except GeminiError as e:
+            log.warning("regen failed: %s", e)
+            await cq.message.answer(f"⚠ Gemini вернул ошибку: {e}")
+            return
+        if not new_text:
+            await cq.message.answer("⚠ Пустой ответ от модели.")
+            return
+        try:
+            await bot.edit_message_text(
+                format_draft(t.title, new_text),
+                chat_id=cq.message.chat.id,
+                message_id=cq.message.message_id,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=draft_kb(),
+            )
+        except TelegramBadRequest as e:
+            log.warning("edit draft failed: %s", e)
+            return
+        await store.update_ai_suggestion_text(
+            cq.message.chat.id, cq.message.message_id, new_text
+        )
+
+    @router.callback_query(F.data == "aino")
+    async def cb_ai_no(cq: CallbackQuery, bot: Bot) -> None:
+        if not cq.message:
+            await cq.answer()
+            return
+        await store.delete_ai_suggestion(cq.message.chat.id, cq.message.message_id)
+        await _safe_delete(bot, cq.message.chat.id, cq.message.message_id)
+        await cq.answer("Закрыто")
+
+    # ----- AI on/off + learn-from-history ------------------------------------
+
+    @router.message(Command("ai_on"))
+    async def cmd_ai_on(message: Message) -> None:
+        if not await store.is_unlocked():
+            return
+        if not suggester or not suggester.configured:
+            await message.answer("⚠ Gemini не настроен (нет GEMINI_API_KEY).")
+            return
+        await suggester.set_enabled(True)
+        await message.answer("🤖 AI-черновики включены. Под каждой новой темой будет приходить предложенный ответ + кнопки.")
+
+    @router.message(Command("ai_off"))
+    async def cmd_ai_off(message: Message) -> None:
+        if not await store.is_unlocked():
+            return
+        if not suggester:
+            return
+        await suggester.set_enabled(False)
+        await message.answer("🤖 AI-черновики выключены.")
+
+    @router.message(Command("ai_status"))
+    async def cmd_ai_status(message: Message) -> None:
+        if not await store.is_unlocked():
+            return
+        configured = bool(suggester and suggester.configured)
+        enabled = await suggester.is_enabled() if suggester else False
+        learned = await store.count_my_replies()
+        lines = [
+            f"🤖 AI: {'ON' if enabled else 'OFF'}",
+            f"ключ: {'есть' if configured else 'нет (GEMINI_API_KEY пуст)'}",
+            f"модель: <code>{config.gemini_model}</code>",
+            f"обучено реплик: <b>{learned}</b>",
+        ]
+        await message.answer("\n".join(lines), parse_mode="HTML")
+
+    _learn_lock = asyncio.Lock()
+
+    @router.message(Command("learn_replies"))
+    async def cmd_learn_replies(message: Message) -> None:
+        if not await store.is_unlocked():
+            return
+        if _learn_lock.locked():
+            await message.answer("⏳ Парсер уже работает, дождись окончания.")
+            return
+        if not store.self_user_id:
+            await message.answer("⚠ Не знаю собственный user_id (lolz API недоступен?).")
+            return
+
+        # Optional argument: number of pages to scan (default 50).
+        parts = (message.text or "").split()
+        max_pages = 50
+        target = 500
+        if len(parts) > 1 and parts[1].isdigit():
+            max_pages = max(1, min(int(parts[1]), 200))
+        if len(parts) > 2 and parts[2].isdigit():
+            target = max(50, min(int(parts[2]), 5000))
+
+        async with _learn_lock:
+            await message.answer(
+                f"📚 Учу стиль: пагинирую timeline (до {max_pages} стр., цель — {target} реплик). "
+                "Это займёт время из-за rate-limit lolz."
+            )
+
+            async def _on_progress(s: str) -> None:
+                try:
+                    await message.answer(s)
+                except TelegramBadRequest:
+                    pass
+
+            try:
+                result = await learn_user_replies(
+                    config,
+                    store,
+                    lolz,
+                    user_id=store.self_user_id,
+                    forum_id=config.lolz_offtop_forum_id,
+                    max_pages=max_pages,
+                    target_count=target,
+                    on_progress=_on_progress,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.exception("learn_user_replies failed: %s", e)
+                await message.answer(f"⚠ Сбой парсера: {e}")
+                return
+
+            await message.answer(
+                f"✅ Готово. Просмотрено страниц: {result.pages_scanned}, "
+                f"постов всего: {result.posts_seen}, "
+                f"в БД сейчас: <b>{result.saved_total}</b> "
+                f"(остановка: {result.stopped_reason}).",
+                parse_mode="HTML",
+            )
 
     # ----- ForceReply consumer -------------------------------------------------
 
@@ -726,11 +949,10 @@ async def _build_quoted_body(lolz: LolzClient, quote_post_id: int, my_body: str)
     Best-effort — if the lookup fails we just submit the body without a quote.
     """
     try:
-        data = await lolz._request("GET", f"/posts/{quote_post_id}")
+        post = await lolz.get_post(quote_post_id)
     except LolzApiError as e:
         log.warning("quote lookup failed for post %s: %s", quote_post_id, e)
         return my_body
-    post = data.get("post") or {}
     username = str(post.get("poster_username") or "").strip()
     member_id = int(post.get("poster_user_id", 0) or 0)
     plain = str(post.get("post_body_plain_text") or "").strip()
