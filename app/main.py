@@ -20,6 +20,7 @@ from app.health import run_http_server
 from app.lolz import LolzClient
 from app.notif_poller import NotifPoller
 from app.poller import Poller
+from app.viewer import Viewer
 
 
 async def amain() -> None:
@@ -56,7 +57,15 @@ async def amain() -> None:
         gemini = GeminiClient(config.gemini_api_key, model=config.gemini_model)
     suggester = AISuggester(config, store, bot, client=gemini)
 
-    dp.include_router(build_router(config, store, lolz, suggester))
+    viewer = Viewer(config, store, lolz)
+    if viewer.configured:
+        viewer.start()
+    else:
+        logging.getLogger(__name__).info(
+            "Viewer disabled: LOLZ_XF_USER_COOKIE / LOLZ_XF_SESSION_COOKIE not set."
+        )
+
+    dp.include_router(build_router(config, store, lolz, suggester, viewer=viewer))
 
     poller = Poller(config, store, lolz, bot, suggester=suggester)
     poller.start()
@@ -94,6 +103,7 @@ async def amain() -> None:
             pass
         await poller.stop()
         await notif_poller.stop()
+        await viewer.stop()
         await suggester.close()
         await lolz.close()
         await bot.session.close()

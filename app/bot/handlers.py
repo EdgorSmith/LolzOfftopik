@@ -32,6 +32,7 @@ from app.bot.keyboards import (
     HELP_BUTTON_TEXT,
     START_BUTTON_TEXT,
     STOP_BUTTON_TEXT,
+    VIEW_TOGGLE_BUTTON_TEXTS,
     cancel_kb,
     confirm_kb,
     main_menu,
@@ -42,6 +43,7 @@ from app.config import Config
 from app.db import Store
 from app.lolz import LolzClient
 from app.lolz.client import LolzApiError
+from app.viewer import Viewer
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +53,7 @@ def build_router(
     store: Store,
     lolz: LolzClient,
     suggester: AISuggester | None = None,
+    viewer: Viewer | None = None,
 ) -> Router:
     router = Router(name="lolzofftopik")
 
@@ -89,6 +92,8 @@ def build_router(
     async def cmd_lock(message: Message) -> None:
         await store.set_unlocked(False)
         await store.set_polling_enabled(False)
+        if viewer:
+            await viewer.set_enabled(False)
         await message.answer(
             "🔒 Заблокировано. Введи пароль, чтобы продолжить.", reply_markup=ReplyKeyboardRemove()
         )
@@ -116,6 +121,38 @@ def build_router(
         if not await store.is_unlocked():
             return
         await _begin_create_thread(message)
+
+    @router.message(Command("view_on"))
+    async def cmd_view_on(message: Message) -> None:
+        if not await store.is_unlocked():
+            return
+        await _set_viewer(message, True)
+
+    @router.message(Command("view_off"))
+    async def cmd_view_off(message: Message) -> None:
+        if not await store.is_unlocked():
+            return
+        await _set_viewer(message, False)
+
+    @router.message(Command("view_status"))
+    async def cmd_view_status(message: Message) -> None:
+        if not await store.is_unlocked():
+            return
+        if not viewer:
+            await message.answer("👀 Просмотр: модуль не инициализирован.")
+            return
+        configured = viewer.configured
+        enabled = await viewer.is_enabled() if configured else False
+        lines = [
+            f"👀 Просмотр: {'ON' if enabled else 'OFF'}",
+            (
+                "куки: <b>есть</b> (xf_user, xf_session)"
+                if configured
+                else "куки: <b>нет</b> (LOLZ_XF_USER_COOKIE / LOLZ_XF_SESSION_COOKIE пусты)"
+            ),
+            f"оффтоп: <code>forum_id={config.lolz_offtop_forum_id}</code>",
+        ]
+        await message.answer("\n".join(lines), parse_mode="HTML")
 
     # Plain text (NOT a ForceReply response, NOT a slash-command) — password gate
     # or main-menu reply-keyboard buttons. Slash-commands are intentionally
@@ -147,6 +184,12 @@ def build_router(
             return
         if text in AI_TOGGLE_BUTTON_TEXTS:
             await _toggle_ai(message)
+            return
+        if text in VIEW_TOGGLE_BUTTON_TEXTS:
+            new_state = not (
+                viewer is not None and await viewer.is_enabled()
+            )
+            await _set_viewer(message, new_state)
             return
         if text == HELP_BUTTON_TEXT:
             await message.answer(
@@ -205,11 +248,36 @@ def build_router(
             reply_markup=await _menu(polling),
         )
 
+    async def _set_viewer(message: Message, new_state: bool) -> None:
+        if not viewer or not viewer.configured:
+            await message.answer(
+                "⚠ Куки сессии lolz не заданы (LOLZ_XF_USER_COOKIE / "
+                "LOLZ_XF_SESSION_COOKIE). Кнопка просмотра ничего не делает."
+            )
+            return
+        await viewer.set_enabled(new_state)
+        polling = await store.is_polling_enabled()
+        await message.answer(
+            "👀 Просмотр включён. Захожу в темы оффтопа под твоей сессией — "
+            "другие пользователи увидят тебя в списке «смотрят тему»."
+            if new_state
+            else "👀 Просмотр выключен.",
+            reply_markup=await _menu(polling),
+        )
+
     async def _menu(polling: bool):
-        """Build the bottom keyboard, hiding the AI row when no key is set."""
+        """Build the bottom keyboard, hiding optional rows when not configured."""
         ai_available = bool(suggester and suggester.configured)
         ai_enabled = await suggester.is_enabled() if ai_available else False
-        return main_menu(polling, ai_available=ai_available, ai_enabled=ai_enabled)
+        viewer_available = bool(viewer and viewer.configured)
+        viewer_enabled = await viewer.is_enabled() if viewer_available else False
+        return main_menu(
+            polling,
+            ai_available=ai_available,
+            ai_enabled=ai_enabled,
+            viewer_available=viewer_available,
+            viewer_enabled=viewer_enabled,
+        )
 
     async def _begin_create_thread(message: Message) -> None:
         prompt = await message.answer(
@@ -299,7 +367,7 @@ def build_router(
         await _safe_delete(bot, cq.message.chat.id, prompt_msg_id)
         await _safe_delete(bot, cq.message.chat.id, cq.message.message_id)
         await cq.answer("❌ Отменено")
-        await _reattach_main_menu(bot, store, cq.message.chat.id, suggester=suggester)
+        await _reattach_main_menu(bot, store, cq.message.chat.id, suggester=suggester, viewer=viewer)
 
     # ----- profile / delete buttons -------------------------------------------
 
@@ -896,7 +964,7 @@ def build_router(
                 await _safe_delete(bot, message.chat.id, int(cancel_msg_id))
             await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
             await _safe_delete(bot, message.chat.id, message.message_id)
-            await _reattach_main_menu(bot, store, message.chat.id, suggester=suggester)
+            await _reattach_main_menu(bot, store, message.chat.id, suggester=suggester, viewer=viewer)
 
         try:
             if action == "create_body":
@@ -1082,16 +1150,25 @@ async def _reattach_main_menu(
     chat_id: int,
     *,
     suggester: AISuggester | None = None,
+    viewer: Viewer | None = None,
 ) -> None:
     """Send a tiny confirmation that re-attaches the persistent reply keyboard."""
     polling = await store.is_polling_enabled()
     ai_available = bool(suggester and suggester.configured)
     ai_enabled = await suggester.is_enabled() if ai_available else False
+    viewer_available = bool(viewer and viewer.configured)
+    viewer_enabled = await viewer.is_enabled() if viewer_available else False
     try:
         await bot.send_message(
             chat_id,
             "✅ Готово.",
-            reply_markup=main_menu(polling, ai_available=ai_available, ai_enabled=ai_enabled),
+            reply_markup=main_menu(
+                polling,
+                ai_available=ai_available,
+                ai_enabled=ai_enabled,
+                viewer_available=viewer_available,
+                viewer_enabled=viewer_enabled,
+            ),
         )
     except TelegramBadRequest as e:
         log.warning("reattach main menu failed: %s", e)
@@ -1111,6 +1188,10 @@ def _help_text(ai_available: bool) -> str:
         "  /offtop_on — слежу за новыми темами в оффтопе",
         "  /offtop_off — приостановить",
         "  /new_thread — создать тему (запросит заголовок)",
+        "",
+        "<b>Просмотр (HTML+cookies)</b>",
+        "  /view_on, /view_off — захожу под твоей сессией в темы оффтопа",
+        "  /view_status — состояние и наличие кук",
     ]
     if ai_available:
         lines += [
@@ -1129,7 +1210,7 @@ def _help_text(ai_available: bool) -> str:
     lines += [
         "",
         "<b>Кнопки</b>",
-        "  ▶/⏹ Оффтопить · 🤖 Нейросеть · 📝 Создать тему · ❓ Команды",
+        "  ▶/⏹ Оффтопить · 🤖 Нейросеть · 👀 Просмотр · 📝 Создать тему · ❓ Команды",
     ]
     return "\n".join(lines)
 
