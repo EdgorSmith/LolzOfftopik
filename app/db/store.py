@@ -66,6 +66,26 @@ CREATE TABLE IF NOT EXISTS file_tokens (
     mime_type TEXT,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
+
+CREATE TABLE IF NOT EXISTS ai_suggestions (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,        -- the suggestion message we sent
+    thread_id INTEGER NOT NULL,
+    suggestion_text TEXT NOT NULL,
+    card_chat_id INTEGER NOT NULL,
+    card_message_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (chat_id, message_id)
+);
+
+CREATE TABLE IF NOT EXISTS my_replies (
+    post_id INTEGER PRIMARY KEY,
+    thread_id INTEGER NOT NULL DEFAULT 0,
+    thread_title TEXT,
+    body_plain TEXT NOT NULL,
+    posted_at INTEGER NOT NULL DEFAULT 0,
+    learned_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
 """
 
 
@@ -189,29 +209,6 @@ class Store:
                 if not row:
                     return None
                 return CardRecord(**dict(row))
-
-    async def update_card_after_reply(
-        self,
-        chat_id: int,
-        old_message_id: int,
-        new_message_id: int,
-        post_id: int,
-    ) -> None:
-        """The card may have been redelivered as a fresh text message after a photo card."""
-        async with self._lock:
-            with self._connect() as conn:
-                if old_message_id != new_message_id:
-                    conn.execute(
-                        "DELETE FROM cards WHERE chat_id=? AND message_id=?",
-                        (chat_id, old_message_id),
-                    )
-                conn.execute(
-                    "INSERT OR REPLACE INTO cards(chat_id,message_id,thread_id,post_id,state,is_photo_card)"
-                    " VALUES(?,?,(SELECT thread_id FROM cards WHERE chat_id=? AND message_id=?),?,'replied',0)",
-                    (chat_id, new_message_id, chat_id, old_message_id, post_id),
-                )
-                # If the previous SELECT returned NULL (race), fix thread_id later via update
-                conn.commit()
 
     async def update_card_thread(self, chat_id: int, message_id: int, thread_id: int, post_id: int) -> None:
         async with self._lock:
@@ -398,3 +395,95 @@ class Store:
                 )
                 conn.commit()
                 return dict(row)
+
+    # ----- AI draft suggestions -------------------------------------------------
+
+    async def add_ai_suggestion(
+        self,
+        chat_id: int,
+        message_id: int,
+        thread_id: int,
+        suggestion_text: str,
+        card_chat_id: int,
+        card_message_id: int,
+    ) -> None:
+        async with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO ai_suggestions"
+                    "(chat_id,message_id,thread_id,suggestion_text,card_chat_id,card_message_id) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (chat_id, message_id, thread_id, suggestion_text, card_chat_id, card_message_id),
+                )
+                conn.commit()
+
+    async def get_ai_suggestion(self, chat_id: int, message_id: int) -> dict | None:
+        async with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT thread_id,suggestion_text,card_chat_id,card_message_id "
+                    "FROM ai_suggestions WHERE chat_id=? AND message_id=?",
+                    (chat_id, message_id),
+                ).fetchone()
+                return dict(row) if row else None
+
+    async def update_ai_suggestion_text(
+        self, chat_id: int, message_id: int, suggestion_text: str
+    ) -> None:
+        async with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE ai_suggestions SET suggestion_text=? "
+                    "WHERE chat_id=? AND message_id=?",
+                    (suggestion_text, chat_id, message_id),
+                )
+                conn.commit()
+
+    async def delete_ai_suggestion(self, chat_id: int, message_id: int) -> None:
+        async with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM ai_suggestions WHERE chat_id=? AND message_id=?",
+                    (chat_id, message_id),
+                )
+                conn.commit()
+
+    # ----- learned old replies (few-shot for the AI) ----------------------------
+
+    async def upsert_my_reply(
+        self,
+        post_id: int,
+        thread_id: int,
+        thread_title: str,
+        body_plain: str,
+        posted_at: int,
+    ) -> None:
+        async with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO my_replies"
+                    "(post_id,thread_id,thread_title,body_plain,posted_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (post_id, thread_id, thread_title, body_plain, posted_at),
+                )
+                conn.commit()
+
+    async def count_my_replies(self) -> int:
+        async with self._lock:
+            with self._connect() as conn:
+                row = conn.execute("SELECT COUNT(*) AS c FROM my_replies").fetchone()
+                return int(row["c"]) if row else 0
+
+    async def sample_my_replies(
+        self, limit: int = 8, *, min_chars: int = 5, max_chars: int = 400
+    ) -> list[str]:
+        """Return up to `limit` representative reply bodies for few-shot prompting."""
+        async with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT body_plain FROM my_replies "
+                    "WHERE LENGTH(body_plain) BETWEEN ? AND ? "
+                    "ORDER BY RANDOM() LIMIT ?",
+                    (min_chars, max_chars, limit),
+                ).fetchall()
+                return [r["body_plain"] for r in rows]
