@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
 
 from aiogram import Bot
 
@@ -12,9 +11,6 @@ from app.bot.cards import send_thread_card
 from app.config import Config
 from app.db import Store
 from app.lolz import LolzClient
-
-if TYPE_CHECKING:  # avoid runtime cycle
-    from app.ai import AISuggester
 
 log = logging.getLogger(__name__)
 
@@ -26,14 +22,11 @@ class Poller:
         store: Store,
         lolz: LolzClient,
         bot: Bot,
-        *,
-        suggester: AISuggester | None = None,
     ) -> None:
         self._config = config
         self._store = store
         self._lolz = lolz
         self._bot = bot
-        self._suggester = suggester
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
@@ -66,8 +59,6 @@ class Poller:
     async def _poll_once(self) -> None:
         if not await self._store.is_polling_enabled():
             return
-        if not await self._store.is_unlocked():
-            return
 
         baseline = await self._store.get_baseline_thread_id()
         threads = await self._lolz.list_threads(
@@ -87,7 +78,7 @@ class Poller:
             if await self._store.is_seen(thread.thread_id):
                 continue
             try:
-                msg = await send_thread_card(
+                await send_thread_card(
                     self._bot, self._store, self._config.telegram_owner_id, thread
                 )
             except Exception:  # noqa: BLE001
@@ -95,7 +86,3 @@ class Poller:
                 continue
             await self._store.mark_seen(thread.thread_id)
             await self._store.set_baseline_thread_id(thread.thread_id)
-            if self._suggester and msg is not None:
-                self._suggester.schedule(
-                    self._config.telegram_owner_id, msg.message_id, thread
-                )

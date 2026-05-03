@@ -39,7 +39,11 @@ class LolzClient:
             self._session = aiohttp.ClientSession(
                 headers={
                     "Authorization": f"Bearer {self._token}",
-                    "User-Agent": "LolzOfftopik/0.1 (+personal-tg-client)",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/122.0.0.0 Safari/537.36"
+                    ),
                     "Accept": "application/json",
                 },
                 timeout=aiohttp.ClientTimeout(total=30),

@@ -7,36 +7,28 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardBu
 START_BUTTON_TEXT = "▶ Начать оффтопить"
 STOP_BUTTON_TEXT = "⏹ Окончить оффтоп"
 CREATE_THREAD_BUTTON_TEXT = "📝 Создать тему"
-AI_ON_BUTTON_TEXT = "🤖 Нейросеть: вкл"
-AI_OFF_BUTTON_TEXT = "🤖 Нейросеть: выкл"
 VIEW_ON_BUTTON_TEXT = "👀 Просмотр: вкл"
 VIEW_OFF_BUTTON_TEXT = "👀 Просмотр: выкл"
 HELP_BUTTON_TEXT = "❓ Команды"
 # Either label triggers the toggle handler.
-AI_TOGGLE_BUTTON_TEXTS = (AI_ON_BUTTON_TEXT, AI_OFF_BUTTON_TEXT)
 VIEW_TOGGLE_BUTTON_TEXTS = (VIEW_ON_BUTTON_TEXT, VIEW_OFF_BUTTON_TEXT)
 
 
 def main_menu(
     polling_enabled: bool,
     *,
-    ai_available: bool = False,
-    ai_enabled: bool = False,
     viewer_available: bool = False,
     viewer_enabled: bool = False,
 ) -> ReplyKeyboardMarkup:
     """Bottom reply keyboard.
 
-    The AI row is rendered only when ``ai_available`` is true (i.e. a Gemini
-    key is configured). Same for the Viewer row — hidden if cookies are
-    missing so the user doesn't see a button that does nothing.
+    The Viewer row is rendered only when ``viewer_available`` is true (i.e.
+    session cookies are configured). Without cookies the row is hidden so
+    the user doesn't see a button that does nothing.
     """
     poll_label = STOP_BUTTON_TEXT if polling_enabled else START_BUTTON_TEXT
-    ai_label = AI_ON_BUTTON_TEXT if ai_enabled else AI_OFF_BUTTON_TEXT
     view_label = VIEW_ON_BUTTON_TEXT if viewer_enabled else VIEW_OFF_BUTTON_TEXT
     rows = [[KeyboardButton(text=poll_label)]]
-    if ai_available:
-        rows.append([KeyboardButton(text=ai_label)])
     if viewer_available:
         rows.append([KeyboardButton(text=view_label)])
     rows.append([

@@ -77,8 +77,6 @@ class NotifPoller:
                 pass
 
     async def _poll_once(self) -> None:
-        if not await self._store.is_unlocked():
-            return
         try:
             data = await self._lolz.list_notifications(limit=20, page=1)
         except LolzApiError as e:

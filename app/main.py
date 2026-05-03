@@ -10,7 +10,6 @@ import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 
-from app.ai import AISuggester, GeminiClient
 from app.bot.handlers import build_router
 from app.config import Config
 from app.db import Store
@@ -52,12 +51,7 @@ async def amain() -> None:
     )
     dp = Dispatcher()
 
-    gemini: GeminiClient | None = None
-    if config.gemini_api_key:
-        gemini = GeminiClient(config.gemini_api_key, model=config.gemini_model)
-    suggester = AISuggester(config, store, bot, client=gemini)
-
-    viewer = Viewer(config, store, lolz)
+    viewer = Viewer(config, store, lolz, bot)
     if viewer.configured:
         viewer.start()
     else:
@@ -65,9 +59,9 @@ async def amain() -> None:
             "Viewer disabled: LOLZ_XF_USER_COOKIE / LOLZ_XF_SESSION_COOKIE not set."
         )
 
-    dp.include_router(build_router(config, store, lolz, suggester, viewer=viewer))
+    dp.include_router(build_router(config, store, lolz, viewer=viewer))
 
-    poller = Poller(config, store, lolz, bot, suggester=suggester)
+    poller = Poller(config, store, lolz, bot)
     poller.start()
 
     notif_poller = NotifPoller(config, store, lolz, bot)
@@ -104,7 +98,6 @@ async def amain() -> None:
         await poller.stop()
         await notif_poller.stop()
         await viewer.stop()
-        await suggester.close()
         await lolz.close()
         await bot.session.close()
         await http_runner.cleanup()

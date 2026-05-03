@@ -6,8 +6,8 @@
 - присылает их тебе в личку с фото/видео из первого поста и кнопками **❤ Лайк** / **✍ Ответить**;
 - после ответа карточка темы превращается в «✅ Ответил…» с кнопкой **✏ Изменить ответ**;
 - управление поллингом — кнопками **▶ Начать оффтопить** / **⏹ Окончить оффтоп**;
-- защищён паролем (по умолчанию `мега`) — без пароля бот молчит;
-- ограничен одним пользователем (`TELEGRAM_OWNER_ID`).
+- доступен только владельцу (`TELEGRAM_OWNER_ID`); любой другой получает «⛔ Вы не создатель.»;
+- режим **«👀 Просмотр»** — заходит на HTML-страницы тем под твоей сессией, чтобы XenForo показывал тебя в виджете «members currently viewing this thread» (см. ниже).
 
 ## Локальный запуск
 
@@ -18,11 +18,6 @@ pip install -r requirements.txt
 python -m app.main
 ```
 
-После запуска:
-- открой бота в Telegram, нажми `/start`,
-- введи пароль `мега`,
-- нажми `▶ Начать оффтопить`.
-
 ## Деплой на Render (free Web Service)
 
 1. В Render → New → Web Service → подключить этот репозиторий.
@@ -30,6 +25,7 @@ python -m app.main
 3. Start command: `python -m app.main`
 4. Добавить env vars: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `LOLZ_API_TOKEN` (остальные есть в `render.yaml`).
 5. Health check path: `/health`.
+6. (Опционально) `LOLZ_XF_USER_COOKIE`, `LOLZ_XF_SESSION_COOKIE`, `LOLZ_XF_CSRF_COOKIE` — для режима «Просмотр».
 
 Free-план Render усыпляет сервис после ~15 минут без HTTP-трафика. Чтобы держать его живым:
 
@@ -39,33 +35,18 @@ Free-план Render усыпляет сервис после ~15 минут б�
 
 См. `.env.example`.
 
-## AI-черновики ответов (опционально)
+## Режим «👀 Просмотр»
 
-Если задан `GEMINI_API_KEY`, бот под каждой новой темой присылает отдельным
-сообщением **черновик ответа** от Gemini с тремя кнопками:
+Когда заданы все три куки сессии (`xf_user`, `xf_session`, `xf_csrf` — взять из DevTools браузера, где залогинен на lolz.live), в нижней клавиатуре появляется кнопка **«👀 Просмотр: вкл/выкл»**. После включения бот в фоне ходит по темам форума `LOLZ_OFFTOP_FORUM_ID` под твоей сессией. Другие пользователи видят тебя в списке «смотрят тему».
 
-- **✅ Разрешить** — отправить этот текст в тему как ответ;
-- **🔄 Другой вариант** — перегенерировать с другим temperature;
-- **❌ Закрыть** — просто удалить черновик.
+Поведение целенаправленно «человечное»:
 
-**Пока ты не нажал «Разрешить» — на форум ничего не уходит.** Включение/выключение
-рантайм:
-
-- `/ai_on` — включить черновики;
-- `/ai_off` — выключить;
-- `/ai_status` — состояние, модель, кол-во обученных реплик.
-
-Чтобы AI отвечал в твоём стиле, сначала спарси свои старые ответы из оффтопа:
-
-```
-/learn_replies                    # 50 страниц timeline, до 500 реплик
-/learn_replies 100                # 100 страниц
-/learn_replies 50 1000            # 50 страниц, цель — 1000 реплик
-```
-
-Парсер ходит по `/users/{me}/timeline`, фильтрует посты в форуме `LOLZ_OFFTOP_FORUM_ID`,
-очищает BBCode и складывает в SQLite. Из-за rate-limit lolz API (3 сек/запрос)
-сбор займёт время.
+- Несколько параллельных «вкладок» (`CONCURRENCY` в `app/viewer.py`).
+- Длительность «чтения» — экспоненциальное распределение (короткие просмотры частые, длинные редкие).
+- ~10% тем «закрыл сразу», ~25% тем — догрузка `?page=2`.
+- Никаких фиксированных интервалов между темами.
+- Браузерный fingerprint: реалистичный Chrome User-Agent, `Sec-Fetch-*`, `Accept-Language: ru-RU`, `Referer`.
+- При 3 ответах подряд `401`/`403` — бот сам выключает просмотр и шлёт в ТГ «❗ Куки протухли».
 
 ## Структура
 
@@ -76,16 +57,13 @@ app/
   health.py        # /health HTTP endpoint
   poller.py        # background poll loop
   notif_poller.py  # /notifications -> Telegram
+  viewer.py        # «Просмотр» — HTML hits with browser cookies
   db/store.py      # SQLite state
   lolz/
     client.py      # Bearer-auth lolz API client (rate-limited)
     parser.py      # post -> thread, media extraction
-  ai/
-    gemini.py      # async REST client for Gemini generateContent
-    suggester.py   # build prompt -> draft message + permission buttons
-    learn.py       # walk timeline, store user's old offtop replies
   bot/
-    handlers.py    # aiogram handlers (password, start/stop, like/reply/edit, ai)
+    handlers.py    # aiogram handlers (start/stop, like/reply/edit, view)
     cards.py       # render thread cards / replied state in TG
     keyboards.py   # inline keyboards
 ```
