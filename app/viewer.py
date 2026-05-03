@@ -24,11 +24,18 @@ Behaviour goals:
   seconds. Per-thread "dwell time" is drawn from an exponential
   distribution clamped to a sensible range; some threads are read briefly,
   some are read longer, some are opened and immediately closed.
-* Multiple concurrent "tabs" (configurable, default 2). A real reader
-  opens a thread, scrolls a bit, opens another in a new tab while the
-  first stays loaded. Concurrency-1 is the obvious bot pattern.
-* Occasional second-page loads (``?page=2``) on the same thread to mimic
-  scroll-down behaviour.
+* Single sequential reader (one "tab"). Multi-tab parallelism is the
+  obvious automation pattern when paired with constant traffic — a real
+  forum scroller reads one thread at a time.
+* Small variable "click delay" between threads (≤ 5 s) instead of
+  stitching threads back-to-back. Real users hesitate, scan the title
+  list, hover a bit before clicking.
+* Occasional second/third-page loads on the same thread to mimic
+  scroll-down on long threads.
+* Occasional return-to-forum-index hit (``/forums/8/page-N``) between
+  threads to mimic scrolling the listing.
+* Browser-shaped HTTP fingerprint: stable Chrome UA, modern
+  Sec-Fetch-* / Sec-CH-UA / Priority / Accept-Encoding (br, zstd).
 * If the session cookies expire (3 consecutive 401/403), the viewer
   disables itself and notifies the bot owner.
 """
@@ -71,15 +78,20 @@ _CHROME_UAS = (
 
 # Tunables: kept module-level so they're easy to spot in code review.
 # All times are in seconds.
-DWELL_MEAN = 6.0          # mean of exponential dwell-time distribution
-DWELL_MIN = 1.0           # short visits ("opened, closed")
-DWELL_MAX = 22.0          # long visits ("read attentively")
-QUICK_BOUNCE_PROB = 0.10  # chance a thread is closed in <2s
-PAGE_TWO_PROB = 0.25      # chance we load /page-2 mid-dwell
-CONCURRENCY = 2           # number of parallel "open tabs"
-LIST_REFRESH_LIMIT = 100  # threads pulled per listing pass
-RECENT_VIEWED_WINDOW = 30 # don't repeat a thread within this many views
-COOKIE_FAIL_THRESHOLD = 3 # consecutive 401/403 → disable + notify
+DWELL_MEAN = 9.0           # mean of exponential dwell-time distribution
+DWELL_MIN = 2.5            # short visits ("opened, glanced, closed")
+DWELL_MAX = 45.0           # long visits ("got hooked, read it fully")
+QUICK_BOUNCE_PROB = 0.15   # chance a thread is bounced in <2.5s
+QUICK_BOUNCE_MIN = 0.8     # "misclicked / not interesting" floor
+QUICK_BOUNCE_MAX = 2.4     # ≤ 2.4s reads as a clear bounce
+PAGE_TWO_PROB = 0.22       # chance we load /page-2 mid-dwell
+PAGE_THREE_PROB = 0.10     # chance we also load /page-3 (only on longer reads)
+FORUM_BROWSE_PROB = 0.18   # chance we hit /forums/8/page-N between threads
+INTER_THREAD_MIN = 0.4     # min "click-next" gap (s)
+INTER_THREAD_MAX = 4.8     # max "click-next" gap (s) — keep ≤ 5s per spec
+LIST_REFRESH_LIMIT = 100   # threads pulled per listing pass
+RECENT_VIEWED_WINDOW = 30  # don't repeat a thread within this many views
+COOKIE_FAIL_THRESHOLD = 3  # consecutive 401/403 → disable + notify
 
 
 class Viewer:
@@ -115,6 +127,13 @@ class Viewer:
         # Consecutive auth failures — used to detect cookie expiry.
         self._auth_fail_streak = 0
         self._views_total = 0
+        # The most recently viewed thread URL — used as Referer for the
+        # *next* thread navigation, so the request chain matches what a
+        # browser actually sends when you click forward through a forum.
+        self._last_thread_url: str | None = None
+        # Cycling through forum-index pages so the periodic "scroll" hits
+        # different parts of the listing.
+        self._forum_browse_page: int = 1
 
     # ---------------------------------------------------------------- state
 
@@ -142,10 +161,11 @@ class Viewer:
         if self._workers and any(not t.done() for t in self._workers):
             return
         self._stop_event.clear()
-        self._workers = [
-            asyncio.create_task(self._loop(i), name=f"viewer-{i}")
-            for i in range(CONCURRENCY)
-        ]
+        # Single-reader model. Concurrency-N looked more human in code
+        # review ("opens N tabs") but in practice on a forum a real user
+        # scrolls one thread at a time; parallel HTML hits to /threads/...
+        # against the same XenForo session is more anomalous, not less.
+        self._workers = [asyncio.create_task(self._loop(0), name="viewer-0")]
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -164,9 +184,6 @@ class Viewer:
     # ---------------------------------------------------------------- loop
 
     async def _loop(self, worker_id: int) -> None:
-        # Stagger workers slightly so they don't fire in lock-step.
-        if worker_id > 0:
-            await self._sleep_or_stop(random.uniform(0.5, 2.5) * worker_id)
         while not self._stop_event.is_set():
             try:
                 await self._tick(worker_id)
@@ -174,20 +191,22 @@ class Viewer:
                 raise
             except Exception:  # noqa: BLE001
                 log.exception("viewer[%d] iteration failed", worker_id)
-                await self._sleep_or_stop(15)
+                # Backoff on unknown failure but stay within human range.
+                await self._sleep_or_stop(random.uniform(2.0, 5.0))
 
     async def _tick(self, worker_id: int) -> None:
         if not self.configured:
             await self._sleep_or_stop(60)
             return
         if not await self.is_enabled():
-            await self._sleep_or_stop(10)
+            await self._sleep_or_stop(5)
             return
 
         thread_id = await self._next_thread_id()
         if not thread_id:
             # Empty pool — give the candidate-refill a moment and retry.
-            await self._sleep_or_stop(random.uniform(3.0, 8.0))
+            # Capped at 5s per spec.
+            await self._sleep_or_stop(random.uniform(3.0, 5.0))
             return
 
         await self._view_thread(thread_id, worker_id)
@@ -200,17 +219,42 @@ class Viewer:
         # how real readers spend time on threads — most are quick, a few
         # are long. Clamped so we don't sit on one thread for hours.
         if random.random() < QUICK_BOUNCE_PROB:
-            dwell = random.uniform(0.5, 2.0)
+            dwell = random.uniform(QUICK_BOUNCE_MIN, QUICK_BOUNCE_MAX)
         else:
-            dwell = max(DWELL_MIN, min(DWELL_MAX, random.expovariate(1.0 / DWELL_MEAN)))
+            dwell = max(
+                DWELL_MIN,
+                min(DWELL_MAX, random.expovariate(1.0 / DWELL_MEAN)),
+            )
 
-        # Halfway through the dwell, sometimes load page 2 (scroll-down).
-        if random.random() < PAGE_TWO_PROB and dwell > 3.0:
-            await self._sleep_or_stop(dwell * 0.4)
+        # Page 2/3 "scroll-down". Only triggers on longer dwells where it
+        # makes sense for a human to scroll past the first page.
+        if random.random() < PAGE_TWO_PROB and dwell > 4.0:
+            # Slice the dwell: read p1, then p2, then optionally p3.
+            p1 = dwell * random.uniform(0.30, 0.45)
+            await self._sleep_or_stop(p1)
             await self._view_thread(thread_id, worker_id, page=2)
-            await self._sleep_or_stop(dwell * 0.6)
+            if dwell > 12.0 and random.random() < PAGE_THREE_PROB:
+                p2 = dwell * random.uniform(0.20, 0.30)
+                await self._sleep_or_stop(p2)
+                await self._view_thread(thread_id, worker_id, page=3)
+                await self._sleep_or_stop(max(0.0, dwell - p1 - p2))
+            else:
+                await self._sleep_or_stop(max(0.0, dwell - p1))
         else:
             await self._sleep_or_stop(dwell)
+
+        # Sometimes "go back to the forum" before opening the next thread —
+        # mimics the natural click → back → scroll → click loop. The forum-
+        # index hit also rotates the candidate pool indirectly (next refill
+        # comes from a fresh listing).
+        if random.random() < FORUM_BROWSE_PROB:
+            await self._view_forum_index(worker_id)
+
+        # "Click-next" gap: short variable pause before the next thread.
+        # Capped at 5s — the user explicitly said no long breaks.
+        await self._sleep_or_stop(
+            random.uniform(INTER_THREAD_MIN, INTER_THREAD_MAX)
+        )
 
     # ---------------------------------------------------------------- candidates
 
@@ -244,6 +288,21 @@ class Viewer:
 
     # ---------------------------------------------------------------- HTTP
 
+    def _sec_ch_ua(self) -> str:
+        # Match the major Chrome version baked into the picked UA so the
+        # Sec-CH-UA hint is internally consistent. Real Chrome sends a
+        # 3-brand string; ours mirrors that.
+        ua = self._ua
+        major = "122"
+        for v in ("120", "121", "122", "123"):
+            if f"Chrome/{v}" in ua:
+                major = v
+                break
+        return (
+            f'"Not(A:Brand";v="24", "Chromium";v="{major}", '
+            f'"Google Chrome";v="{major}"'
+        )
+
     async def _ensure_http(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
             jar = aiohttp.CookieJar(unsafe=False)
@@ -263,14 +322,20 @@ class Viewer:
                         "q=0.9,image/avif,image/webp,*/*;q=0.8"
                     ),
                     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-                    "Accept-Encoding": "gzip, deflate, br",
+                    # aiohttp doesn't transparently decode br/zstd, but
+                    # advertising them matches what Chrome actually sends.
+                    "Accept-Encoding": "gzip, deflate, br, zstd",
                     "Cache-Control": "no-cache",
                     "Pragma": "no-cache",
+                    "Sec-Ch-Ua": self._sec_ch_ua(),
+                    "Sec-Ch-Ua-Mobile": "?0",
+                    "Sec-Ch-Ua-Platform": '"Windows"',
                     "Sec-Fetch-Dest": "document",
                     "Sec-Fetch-Mode": "navigate",
                     "Sec-Fetch-Site": "same-origin",
                     "Sec-Fetch-User": "?1",
                     "Upgrade-Insecure-Requests": "1",
+                    "Priority": "u=0, i",
                     "DNT": "1",
                 },
                 timeout=aiohttp.ClientTimeout(total=20),
@@ -287,10 +352,17 @@ class Viewer:
             f"{self._config.lolz_web_base}/forums/"
             f"{self._config.lolz_offtop_forum_id}/"
         )
-        # Page 1 referer is the forum listing (clicked from list); page 2
-        # referer is page 1 (in-thread navigation). This matches what a
-        # browser sends.
-        referer = forum_url if page == 1 else base
+        # Referer chain reflects the user's actual click path:
+        #   - Page 2/3 of *this* thread → page 1 of *this* thread
+        #   - Page 1 of a thread → whatever we last visited (forum index
+        #     or the previous thread; matches "clicked back, then a new
+        #     thread title")
+        if page > 1:
+            referer = base
+        elif self._last_thread_url:
+            referer = self._last_thread_url
+        else:
+            referer = forum_url
         try:
             async with http.get(
                 url,
@@ -310,14 +382,24 @@ class Viewer:
                     if self._auth_fail_streak >= COOKIE_FAIL_THRESHOLD:
                         await self._handle_cookie_expiry()
                     return
+                if resp.status >= 500:
+                    log.warning(
+                        "viewer[%d]: GET %s -> %s (server side)",
+                        worker_id, url, resp.status,
+                    )
+                    # Short backoff on 5xx; capped at 5s per spec.
+                    await self._sleep_or_stop(random.uniform(2.0, 5.0))
+                    return
                 if resp.status >= 400:
                     log.warning(
                         "viewer[%d]: GET %s -> %s",
                         worker_id, url, resp.status,
                     )
                     return
-                # Success: clear the streak.
+                # Success: clear the streak and remember this URL as the
+                # next request's Referer.
                 self._auth_fail_streak = 0
+                self._last_thread_url = url
                 log.info(
                     "viewer[%d]: viewed thread %s%s (%s)",
                     worker_id,
@@ -327,7 +409,47 @@ class Viewer:
                 )
         except (aiohttp.ClientError, TimeoutError) as e:
             log.warning("viewer[%d]: GET %s failed: %s", worker_id, url, e)
-            await self._sleep_or_stop(random.uniform(5.0, 12.0))
+            # Capped backoff on transport error.
+            await self._sleep_or_stop(random.uniform(2.0, 5.0))
+
+    async def _view_forum_index(self, worker_id: int) -> None:
+        """Hit ``/forums/{id}/page-N`` to mimic scrolling the listing.
+
+        We rotate through pages 1..5 so the periodic "back to forum"
+        navigation isn't always landing on the same page. Failures are
+        soft — this is just texture, not a critical hit.
+        """
+        http = await self._ensure_http()
+        page = self._forum_browse_page
+        # Cycle 1 → 5 → 1
+        self._forum_browse_page = (page % 5) + 1
+        forum_url = (
+            f"{self._config.lolz_web_base}/forums/"
+            f"{self._config.lolz_offtop_forum_id}/"
+        )
+        url = forum_url if page == 1 else f"{forum_url}page-{page}"
+        # Referer is the previous thread (just "clicked back").
+        referer = self._last_thread_url or forum_url
+        try:
+            async with http.get(
+                url,
+                headers={"Referer": referer},
+                allow_redirects=True,
+            ) as resp:
+                await resp.read()
+                if resp.status >= 400:
+                    log.debug(
+                        "viewer[%d]: forum index %s -> %s",
+                        worker_id, url, resp.status,
+                    )
+                    return
+                self._last_thread_url = url
+                log.info(
+                    "viewer[%d]: browsed forum index page %d (%s)",
+                    worker_id, page, resp.status,
+                )
+        except (aiohttp.ClientError, TimeoutError) as e:
+            log.debug("viewer[%d]: forum index %s failed: %s", worker_id, url, e)
 
     async def _handle_cookie_expiry(self) -> None:
         """Disable the viewer and notify the owner that cookies expired."""
