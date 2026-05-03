@@ -143,14 +143,6 @@ class Store:
                 conn.execute("DELETE FROM settings WHERE key=?", (key,))
                 conn.commit()
 
-    # ----- bot lock-state -------------------------------------------------------
-
-    async def is_unlocked(self) -> bool:
-        return (await self.get_setting("unlocked")) == "1"
-
-    async def set_unlocked(self, value: bool) -> None:
-        await self.set_setting("unlocked", "1" if value else "0")
-
     async def is_polling_enabled(self) -> bool:
         return (await self.get_setting("polling_enabled")) == "1"
 

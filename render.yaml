@@ -10,8 +10,6 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      - key: BOT_PASSWORD
-        value: мега
       - key: LOLZ_OFFTOP_FORUM_ID
         value: "8"
       - key: LOLZ_OFFTOP_URL
@@ -24,15 +22,11 @@ services:
         sync: false
       - key: LOLZ_API_TOKEN
         sync: false
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: GEMINI_MODEL
-        value: gemini-2.0-flash
-      - key: AI_REPLY_ENABLED
-        value: "0"
       - key: LOLZ_WEB_BASE
         value: https://lolz.live
       - key: LOLZ_XF_USER_COOKIE
         sync: false
       - key: LOLZ_XF_SESSION_COOKIE
+        sync: false
+      - key: LOLZ_XF_CSRF_COOKIE
         sync: false

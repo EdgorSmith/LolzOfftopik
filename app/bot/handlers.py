@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import UTC
 
@@ -17,17 +16,12 @@ from aiogram.types import (
 )
 from aiogram.utils.text_decorations import html_decoration as hd
 
-from app.ai import AISuggester
-from app.ai.gemini import GeminiError
-from app.ai.learn import learn_user_replies
-from app.ai.suggester import draft_kb, format_draft
 from app.bot.cards import (
     send_replies,
     transition_card_to_replied,
     update_replied_card_text,
 )
 from app.bot.keyboards import (
-    AI_TOGGLE_BUTTON_TEXTS,
     CREATE_THREAD_BUTTON_TEXT,
     HELP_BUTTON_TEXT,
     START_BUTTON_TEXT,
@@ -52,92 +46,64 @@ def build_router(
     config: Config,
     store: Store,
     lolz: LolzClient,
-    suggester: AISuggester | None = None,
+    *,
     viewer: Viewer | None = None,
 ) -> Router:
     router = Router(name="lolzofftopik")
 
-    def is_owner(message_or_cq) -> bool:
-        from_user = getattr(message_or_cq, "from_user", None)
-        if not from_user:
-            return False
-        return from_user.id == config.telegram_owner_id
-
     @router.message(F.from_user.id != config.telegram_owner_id)
     async def reject_strangers(message: Message) -> None:
-        # Silently ignore everyone except the owner.
-        log.info("Ignoring message from non-owner uid=%s", message.from_user.id if message.from_user else "?")
+        log.info(
+            "Rejecting non-owner uid=%s",
+            message.from_user.id if message.from_user else "?",
+        )
+        try:
+            await message.answer(
+                "⛔ Вы не создатель.", reply_markup=ReplyKeyboardRemove()
+            )
+        except TelegramBadRequest:
+            pass
 
     @router.callback_query(F.from_user.id != config.telegram_owner_id)
     async def reject_strangers_cb(cq: CallbackQuery) -> None:
-        await cq.answer("Доступ запрещён.", show_alert=False)
+        await cq.answer("⛔ Вы не создатель.", show_alert=True)
 
-    # ----- password gate -------------------------------------------------------
+    # ----- start / help --------------------------------------------------------
 
     @router.message(CommandStart())
     async def cmd_start(message: Message) -> None:
-        if not await store.is_unlocked():
-            await message.answer(
-                "🔒 Введите пароль, чтобы пользоваться ботом.",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            return
         polling = await store.is_polling_enabled()
         await message.answer(
             "Привет. Готов оффтопить.",
             reply_markup=await _menu(polling),
         )
 
-    @router.message(Command("lock"))
-    async def cmd_lock(message: Message) -> None:
-        await store.set_unlocked(False)
-        await store.set_polling_enabled(False)
-        if viewer:
-            await viewer.set_enabled(False)
-        await message.answer(
-            "🔒 Заблокировано. Введи пароль, чтобы продолжить.", reply_markup=ReplyKeyboardRemove()
-        )
-
     @router.message(Command("help", "commands"))
     async def cmd_help(message: Message) -> None:
-        if not await store.is_unlocked():
-            return
-        await message.answer(_help_text(suggester is not None and suggester.configured), parse_mode="HTML")
+        await message.answer(_help_text(), parse_mode="HTML")
 
     @router.message(Command("offtop_on"))
     async def cmd_offtop_on(message: Message, bot: Bot) -> None:
-        if not await store.is_unlocked():
-            return
         await _start_polling(message, bot)
 
     @router.message(Command("offtop_off"))
     async def cmd_offtop_off(message: Message) -> None:
-        if not await store.is_unlocked():
-            return
         await _stop_polling(message)
 
     @router.message(Command("new_thread"))
     async def cmd_new_thread(message: Message) -> None:
-        if not await store.is_unlocked():
-            return
         await _begin_create_thread(message)
 
     @router.message(Command("view_on"))
     async def cmd_view_on(message: Message) -> None:
-        if not await store.is_unlocked():
-            return
         await _set_viewer(message, True)
 
     @router.message(Command("view_off"))
     async def cmd_view_off(message: Message) -> None:
-        if not await store.is_unlocked():
-            return
         await _set_viewer(message, False)
 
     @router.message(Command("view_status"))
     async def cmd_view_status(message: Message) -> None:
-        if not await store.is_unlocked():
-            return
         if not viewer:
             await message.answer("👀 Просмотр: модуль не инициализирован.")
             return
@@ -154,24 +120,12 @@ def build_router(
         ]
         await message.answer("\n".join(lines), parse_mode="HTML")
 
-    # Plain text (NOT a ForceReply response, NOT a slash-command) — password gate
-    # or main-menu reply-keyboard buttons. Slash-commands are intentionally
-    # excluded here so they fall through to their dedicated Command() handlers
-    # below; otherwise this catch-all would swallow /ai_status, /learn_replies,
-    # etc. and they would never fire.
+    # Plain text (NOT a ForceReply response, NOT a slash-command) — main-menu
+    # reply-keyboard buttons. Slash-commands are intentionally excluded here so
+    # they fall through to their dedicated Command() handlers below; otherwise
+    # this catch-all would swallow them.
     @router.message(F.text, F.reply_to_message.is_(None), ~F.text.startswith("/"))
     async def handle_text(message: Message, bot: Bot) -> None:
-        # Locked state — accept password only.
-        if not await store.is_unlocked():
-            if (message.text or "").strip().lower() == config.bot_password.strip().lower():
-                await store.set_unlocked(True)
-                await message.answer(
-                    "✅ Разблокировано. Жми «Начать оффтопить», когда будешь готов.",
-                    reply_markup=await _menu(False),
-                )
-            # Wrong password: stay silent.
-            return
-
         text = (message.text or "").strip()
         if text == START_BUTTON_TEXT:
             await _start_polling(message, bot)
@@ -182,9 +136,6 @@ def build_router(
         if text == CREATE_THREAD_BUTTON_TEXT:
             await _begin_create_thread(message)
             return
-        if text in AI_TOGGLE_BUTTON_TEXTS:
-            await _toggle_ai(message)
-            return
         if text in VIEW_TOGGLE_BUTTON_TEXTS:
             new_state = not (
                 viewer is not None and await viewer.is_enabled()
@@ -192,10 +143,7 @@ def build_router(
             await _set_viewer(message, new_state)
             return
         if text == HELP_BUTTON_TEXT:
-            await message.answer(
-                _help_text(suggester is not None and suggester.configured),
-                parse_mode="HTML",
-            )
+            await message.answer(_help_text(), parse_mode="HTML")
             return
 
         # Otherwise — show the menu.
@@ -232,22 +180,6 @@ def build_router(
         await store.set_polling_enabled(False)
         await message.answer("⏹ Оффтоп остановлен.", reply_markup=await _menu(False))
 
-    async def _toggle_ai(message: Message) -> None:
-        if not suggester or not suggester.configured:
-            await message.answer(
-                "⚠ Gemini не настроен (нет GEMINI_API_KEY). Кнопка ничего не делает."
-            )
-            return
-        new_state = not await suggester.is_enabled()
-        await suggester.set_enabled(new_state)
-        polling = await store.is_polling_enabled()
-        await message.answer(
-            "🤖 Нейросеть включена. Под каждой новой темой будет приходить черновик ответа + кнопки."
-            if new_state
-            else "🤖 Нейросеть выключена. Черновики больше не приходят.",
-            reply_markup=await _menu(polling),
-        )
-
     async def _set_viewer(message: Message, new_state: bool) -> None:
         if not viewer or not viewer.configured:
             await message.answer(
@@ -267,14 +199,10 @@ def build_router(
 
     async def _menu(polling: bool):
         """Build the bottom keyboard, hiding optional rows when not configured."""
-        ai_available = bool(suggester and suggester.configured)
-        ai_enabled = await suggester.is_enabled() if ai_available else False
         viewer_available = bool(viewer and viewer.configured)
         viewer_enabled = await viewer.is_enabled() if viewer_available else False
         return main_menu(
             polling,
-            ai_available=ai_available,
-            ai_enabled=ai_enabled,
             viewer_available=viewer_available,
             viewer_enabled=viewer_enabled,
         )
@@ -295,9 +223,6 @@ def build_router(
 
     @router.callback_query(F.data.startswith("like:"))
     async def cb_like(cq: CallbackQuery, bot: Bot) -> None:
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован, отправь пароль.", show_alert=True)
-            return
         try:
             _, post_id_str, is_liked_str = cq.data.split(":", 2)
             post_id = int(post_id_str)
@@ -367,15 +292,12 @@ def build_router(
         await _safe_delete(bot, cq.message.chat.id, prompt_msg_id)
         await _safe_delete(bot, cq.message.chat.id, cq.message.message_id)
         await cq.answer("❌ Отменено")
-        await _reattach_main_menu(bot, store, cq.message.chat.id, suggester=suggester, viewer=viewer)
+        await _reattach_main_menu(bot, store, cq.message.chat.id, viewer=viewer)
 
     # ----- profile / delete buttons -------------------------------------------
 
     @router.callback_query(F.data.startswith("profile:"))
     async def cb_profile(cq: CallbackQuery) -> None:
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован.", show_alert=True)
-            return
         try:
             _, user_id_str = cq.data.split(":", 1)
             user_id = int(user_id_str)
@@ -405,9 +327,6 @@ def build_router(
 
     @router.callback_query(F.data.startswith("delpost:"))
     async def cb_delpost(cq: CallbackQuery) -> None:
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован.", show_alert=True)
-            return
         try:
             _, post_id_str = cq.data.split(":", 1)
             post_id = int(post_id_str)
@@ -425,9 +344,6 @@ def build_router(
 
     @router.callback_query(F.data.startswith("delpost_yes:"))
     async def cb_delpost_yes(cq: CallbackQuery, bot: Bot) -> None:
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован.", show_alert=True)
-            return
         try:
             _, post_id_str, source_msg_id_str = cq.data.split(":", 2)
             post_id = int(post_id_str)
@@ -449,9 +365,6 @@ def build_router(
 
     @router.callback_query(F.data.startswith("delthread:"))
     async def cb_delthread(cq: CallbackQuery) -> None:
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован.", show_alert=True)
-            return
         try:
             _, thread_id_str = cq.data.split(":", 1)
             thread_id = int(thread_id_str)
@@ -469,9 +382,6 @@ def build_router(
 
     @router.callback_query(F.data.startswith("delthread_yes:"))
     async def cb_delthread_yes(cq: CallbackQuery, bot: Bot) -> None:
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован.", show_alert=True)
-            return
         try:
             _, thread_id_str, source_msg_id_str = cq.data.split(":", 2)
             thread_id = int(thread_id_str)
@@ -492,9 +402,6 @@ def build_router(
     @router.callback_query(F.data.startswith("rlike:"))
     async def cb_rlike(cq: CallbackQuery, bot: Bot) -> None:
         """Compact ❤ button under each reply in the 'view replies' view."""
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован, отправь пароль.", show_alert=True)
-            return
         try:
             _, post_id_str, is_liked_str = cq.data.split(":", 2)
             post_id = int(post_id_str)
@@ -528,9 +435,6 @@ def build_router(
     @router.callback_query(F.data.startswith("creply:"))
     async def cb_creply(cq: CallbackQuery) -> None:
         """Reply to a post-comment notification by posting a comment under that post."""
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован.", show_alert=True)
-            return
         try:
             _, post_id_str = cq.data.split(":", 1)
             post_id = int(post_id_str)
@@ -558,9 +462,6 @@ def build_router(
     @router.callback_query(F.data.startswith("rreply:"))
     async def cb_rreply(cq: CallbackQuery) -> None:
         """Reply to a specific post (from the View Replies stream)."""
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован.", show_alert=True)
-            return
         try:
             _, post_id_str = cq.data.split(":", 1)
             post_id = int(post_id_str)
@@ -602,9 +503,6 @@ def build_router(
 
     @router.callback_query(F.data.startswith("reply:"))
     async def cb_reply(cq: CallbackQuery) -> None:
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован.", show_alert=True)
-            return
         try:
             _, thread_id_str = cq.data.split(":", 1)
             thread_id = int(thread_id_str)
@@ -634,9 +532,6 @@ def build_router(
 
     @router.callback_query(F.data.startswith("edit:"))
     async def cb_edit(cq: CallbackQuery) -> None:
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован.", show_alert=True)
-            return
         try:
             _, post_id_str = cq.data.split(":", 1)
             post_id = int(post_id_str)
@@ -668,9 +563,6 @@ def build_router(
 
     @router.callback_query(F.data.startswith("replies:"))
     async def cb_replies(cq: CallbackQuery, bot: Bot) -> None:
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован.", show_alert=True)
-            return
         try:
             _, thread_id_str = cq.data.split(":", 1)
             thread_id = int(thread_id_str)
@@ -694,226 +586,10 @@ def build_router(
             return
         await send_replies(bot, cq.message.chat.id, thread_id, posts, first_post_id=first_post_id)
 
-    # ----- AI draft replies (aiok / aire / aino) ------------------------------
-
-    @router.callback_query(F.data == "aiok")
-    async def cb_ai_ok(cq: CallbackQuery, bot: Bot) -> None:
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован.", show_alert=True)
-            return
-        if not cq.message:
-            await cq.answer()
-            return
-        rec = await store.get_ai_suggestion(cq.message.chat.id, cq.message.message_id)
-        if not rec:
-            await cq.answer("Черновик уже не висит.", show_alert=True)
-            return
-        thread_id = int(rec["thread_id"])
-        body = (rec["suggestion_text"] or "").strip()
-        if not body:
-            await cq.answer("Пустой черновик.", show_alert=True)
-            return
-        try:
-            post_id = await lolz.reply(thread_id, body)
-        except LolzApiError as e:
-            log.warning("ai reply submit failed: %s", e)
-            await cq.answer(f"Ошибка: {e}", show_alert=True)
-            return
-        if not post_id:
-            await cq.answer("API не вернул post_id.", show_alert=True)
-            return
-
-        # Promote the original card to "Ответил…" — same flow as a manual reply.
-        try:
-            t = await lolz.get_thread(thread_id)
-            title = t.title
-        except LolzApiError:
-            title = ""
-        card = await store.get_card(rec["card_chat_id"], rec["card_message_id"])
-        is_photo_card = bool(card.is_photo_card) if card else False
-        try:
-            await transition_card_to_replied(
-                bot,
-                store,
-                chat_id=rec["card_chat_id"],
-                card_message_id=rec["card_message_id"],
-                is_photo_card=is_photo_card,
-                thread_id=thread_id,
-                thread_title=title,
-                reply_text=body,
-                post_id=post_id,
-            )
-        except TelegramBadRequest as e:
-            log.warning("transition_card_to_replied failed: %s", e)
-
-        await store.delete_ai_suggestion(cq.message.chat.id, cq.message.message_id)
-        await _safe_delete(bot, cq.message.chat.id, cq.message.message_id)
-        await cq.answer("✅ Отправлено")
-
-    @router.callback_query(F.data == "aire")
-    async def cb_ai_regen(cq: CallbackQuery, bot: Bot) -> None:
-        if not await store.is_unlocked():
-            await cq.answer("Бот заблокирован.", show_alert=True)
-            return
-        if not suggester or not suggester.configured:
-            await cq.answer("AI не настроен.", show_alert=True)
-            return
-        if not await suggester.is_enabled():
-            await cq.answer("AI выключен (/ai_on).", show_alert=True)
-            return
-        if not cq.message:
-            await cq.answer()
-            return
-        rec = await store.get_ai_suggestion(cq.message.chat.id, cq.message.message_id)
-        if not rec:
-            await cq.answer("Черновик уже не висит.", show_alert=True)
-            return
-        thread_id = int(rec["thread_id"])
-        await cq.answer("🔄 Генерирую другой вариант…")
-        try:
-            t = await lolz.get_thread(thread_id)
-        except LolzApiError as e:
-            await cq.message.answer(f"⚠ Не удалось получить тему: {e}")
-            return
-        body_text = (
-            t.first_post_body_plain
-            or t.first_post_body
-            or ""
-        ).strip()
-        try:
-            new_text = await suggester.regenerate(t.title, body_text)
-        except GeminiError as e:
-            log.warning("regen failed: %s", e)
-            await cq.message.answer(f"⚠ Gemini вернул ошибку: {e}")
-            return
-        if not new_text:
-            await cq.message.answer("⚠ Пустой ответ от модели.")
-            return
-        try:
-            await bot.edit_message_text(
-                format_draft(t.title, new_text),
-                chat_id=cq.message.chat.id,
-                message_id=cq.message.message_id,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=draft_kb(),
-            )
-        except TelegramBadRequest as e:
-            log.warning("edit draft failed: %s", e)
-            return
-        await store.update_ai_suggestion_text(
-            cq.message.chat.id, cq.message.message_id, new_text
-        )
-
-    @router.callback_query(F.data == "aino")
-    async def cb_ai_no(cq: CallbackQuery, bot: Bot) -> None:
-        if not cq.message:
-            await cq.answer()
-            return
-        await store.delete_ai_suggestion(cq.message.chat.id, cq.message.message_id)
-        await _safe_delete(bot, cq.message.chat.id, cq.message.message_id)
-        await cq.answer("Закрыто")
-
-    # ----- AI on/off + learn-from-history ------------------------------------
-
-    @router.message(Command("ai_on"))
-    async def cmd_ai_on(message: Message) -> None:
-        if not await store.is_unlocked():
-            return
-        if not suggester or not suggester.configured:
-            await message.answer("⚠ Gemini не настроен (нет GEMINI_API_KEY).")
-            return
-        await suggester.set_enabled(True)
-        await message.answer("🤖 AI-черновики включены. Под каждой новой темой будет приходить предложенный ответ + кнопки.")
-
-    @router.message(Command("ai_off"))
-    async def cmd_ai_off(message: Message) -> None:
-        if not await store.is_unlocked():
-            return
-        if not suggester:
-            return
-        await suggester.set_enabled(False)
-        await message.answer("🤖 AI-черновики выключены.")
-
-    @router.message(Command("ai_status"))
-    async def cmd_ai_status(message: Message) -> None:
-        if not await store.is_unlocked():
-            return
-        configured = bool(suggester and suggester.configured)
-        enabled = await suggester.is_enabled() if suggester else False
-        learned = await store.count_my_replies()
-        lines = [
-            f"🤖 AI: {'ON' if enabled else 'OFF'}",
-            f"ключ: {'есть' if configured else 'нет (GEMINI_API_KEY пуст)'}",
-            f"модель: <code>{config.gemini_model}</code>",
-            f"обучено реплик: <b>{learned}</b>",
-        ]
-        await message.answer("\n".join(lines), parse_mode="HTML")
-
-    _learn_lock = asyncio.Lock()
-
-    @router.message(Command("learn_replies"))
-    async def cmd_learn_replies(message: Message) -> None:
-        if not await store.is_unlocked():
-            return
-        if _learn_lock.locked():
-            await message.answer("⏳ Парсер уже работает, дождись окончания.")
-            return
-        if not store.self_user_id:
-            await message.answer("⚠ Не знаю собственный user_id (lolz API недоступен?).")
-            return
-
-        # Optional argument: number of pages to scan (default 50).
-        parts = (message.text or "").split()
-        max_pages = 50
-        target = 500
-        if len(parts) > 1 and parts[1].isdigit():
-            max_pages = max(1, min(int(parts[1]), 200))
-        if len(parts) > 2 and parts[2].isdigit():
-            target = max(50, min(int(parts[2]), 5000))
-
-        async with _learn_lock:
-            await message.answer(
-                f"📚 Учу стиль: пагинирую timeline (до {max_pages} стр., цель — {target} реплик). "
-                "Это займёт время из-за rate-limit lolz."
-            )
-
-            async def _on_progress(s: str) -> None:
-                try:
-                    await message.answer(s)
-                except TelegramBadRequest:
-                    pass
-
-            try:
-                result = await learn_user_replies(
-                    config,
-                    store,
-                    lolz,
-                    user_id=store.self_user_id,
-                    forum_id=config.lolz_offtop_forum_id,
-                    max_pages=max_pages,
-                    target_count=target,
-                    on_progress=_on_progress,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.exception("learn_user_replies failed: %s", e)
-                await message.answer(f"⚠ Сбой парсера: {e}")
-                return
-
-            await message.answer(
-                f"✅ Готово. Просмотрено страниц: {result.pages_scanned}, "
-                f"постов всего: {result.posts_seen}, "
-                f"в БД сейчас: <b>{result.saved_total}</b> "
-                f"(остановка: {result.stopped_reason}).",
-                parse_mode="HTML",
-            )
-
     # ----- ForceReply consumer -------------------------------------------------
 
     @router.message(F.reply_to_message)
     async def handle_force_reply(message: Message, bot: Bot) -> None:
-        if not await store.is_unlocked():
-            return
         if not message.reply_to_message:
             return
         pending = await store.pop_pending(message.chat.id, message.reply_to_message.message_id)
@@ -964,7 +640,7 @@ def build_router(
                 await _safe_delete(bot, message.chat.id, int(cancel_msg_id))
             await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
             await _safe_delete(bot, message.chat.id, message.message_id)
-            await _reattach_main_menu(bot, store, message.chat.id, suggester=suggester, viewer=viewer)
+            await _reattach_main_menu(bot, store, message.chat.id, viewer=viewer)
 
         try:
             if action == "create_body":
@@ -1149,13 +825,10 @@ async def _reattach_main_menu(
     store: Store,
     chat_id: int,
     *,
-    suggester: AISuggester | None = None,
     viewer: Viewer | None = None,
 ) -> None:
     """Send a tiny confirmation that re-attaches the persistent reply keyboard."""
     polling = await store.is_polling_enabled()
-    ai_available = bool(suggester and suggester.configured)
-    ai_enabled = await suggester.is_enabled() if ai_available else False
     viewer_available = bool(viewer and viewer.configured)
     viewer_enabled = await viewer.is_enabled() if viewer_available else False
     try:
@@ -1164,8 +837,6 @@ async def _reattach_main_menu(
             "✅ Готово.",
             reply_markup=main_menu(
                 polling,
-                ai_available=ai_available,
-                ai_enabled=ai_enabled,
                 viewer_available=viewer_available,
                 viewer_enabled=viewer_enabled,
             ),
@@ -1174,7 +845,7 @@ async def _reattach_main_menu(
         log.warning("reattach main menu failed: %s", e)
 
 
-def _help_text(ai_available: bool) -> str:
+def _help_text() -> str:
     """Pretty-printed list of all bot commands."""
     lines: list[str] = [
         "<b>Команды</b>",
@@ -1182,7 +853,6 @@ def _help_text(ai_available: bool) -> str:
         "<b>Базовые</b>",
         "  /start — поприветствовать, показать клавиатуру",
         "  /help, /commands — этот список",
-        "  /lock — заблокировать бота (нужен пароль для разблока)",
         "",
         "<b>Оффтоп-поллер</b>",
         "  /offtop_on — слежу за новыми темами в оффтопе",
@@ -1192,25 +862,9 @@ def _help_text(ai_available: bool) -> str:
         "<b>Просмотр (HTML+cookies)</b>",
         "  /view_on, /view_off — захожу под твоей сессией в темы оффтопа",
         "  /view_status — состояние и наличие кук",
-    ]
-    if ai_available:
-        lines += [
-            "",
-            "<b>AI-черновики</b> (Gemini)",
-            "  /ai_on, /ai_off — включить/выключить",
-            "  /ai_status — состояние, модель, сколько реплик выучено",
-            "  /learn_replies [pages] [target] — спарсить старые ответы для стиля",
-            "      пример: <code>/learn_replies 50 500</code>",
-        ]
-    else:
-        lines += [
-            "",
-            "<i>AI-черновики выключены: не задан GEMINI_API_KEY.</i>",
-        ]
-    lines += [
         "",
         "<b>Кнопки</b>",
-        "  ▶/⏹ Оффтопить · 🤖 Нейросеть · 👀 Просмотр · 📝 Создать тему · ❓ Команды",
+        "  ▶/⏹ Оффтопить · 👀 Просмотр · 📝 Создать тему · ❓ Команды",
     ]
     return "\n".join(lines)
 
