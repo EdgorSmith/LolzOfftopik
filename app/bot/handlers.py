@@ -22,14 +22,18 @@ from app.bot.cards import (
     update_replied_card_text,
 )
 from app.bot.keyboards import (
+    BALANCE_BUTTON_TEXT,
     CREATE_THREAD_BUTTON_TEXT,
     HELP_BUTTON_TEXT,
+    NOTIFS_TOGGLE_BUTTON_TEXTS,
     START_BUTTON_TEXT,
     STOP_BUTTON_TEXT,
-    VIEW_TOGGLE_BUTTON_TEXTS,
+    TRANSFER_BUTTON_TEXT,
     cancel_kb,
     confirm_kb,
+    confirm_transfer_kb,
     main_menu,
+    profile_actions_kb,
     reply_like_kb,
     thread_card_kb,
 )
@@ -37,7 +41,6 @@ from app.config import Config
 from app.db import Store
 from app.lolz import LolzClient
 from app.lolz.client import LolzApiError
-from app.viewer import Viewer
 
 log = logging.getLogger(__name__)
 
@@ -46,10 +49,12 @@ def build_router(
     config: Config,
     store: Store,
     lolz: LolzClient,
-    *,
-    viewer: Viewer | None = None,
 ) -> Router:
     router = Router(name="lolzofftopik")
+    # Cache pending money-transfer details between the "enter amount" step
+    # and the confirm-button click. Keyed by (chat_id, confirm_message_id);
+    # entries are dropped after the confirm/cancel callback fires.
+    transfer_pending: dict[tuple[int, int], dict] = {}
 
     @router.message(F.from_user.id != config.telegram_owner_id)
     async def reject_strangers(message: Message) -> None:
@@ -94,31 +99,21 @@ def build_router(
     async def cmd_new_thread(message: Message) -> None:
         await _begin_create_thread(message)
 
-    @router.message(Command("view_on"))
-    async def cmd_view_on(message: Message) -> None:
-        await _set_viewer(message, True)
+    @router.message(Command("notifs_on"))
+    async def cmd_notifs_on(message: Message) -> None:
+        await _set_notifications(message, True)
 
-    @router.message(Command("view_off"))
-    async def cmd_view_off(message: Message) -> None:
-        await _set_viewer(message, False)
+    @router.message(Command("notifs_off"))
+    async def cmd_notifs_off(message: Message) -> None:
+        await _set_notifications(message, False)
 
-    @router.message(Command("view_status"))
-    async def cmd_view_status(message: Message) -> None:
-        if not viewer:
-            await message.answer("👀 Просмотр: модуль не инициализирован.")
-            return
-        configured = viewer.configured
-        enabled = await viewer.is_enabled() if configured else False
-        lines = [
-            f"👀 Просмотр: {'ON' if enabled else 'OFF'}",
-            (
-                "куки: <b>есть</b> (xf_user, xf_session)"
-                if configured
-                else "куки: <b>нет</b> (LOLZ_XF_USER_COOKIE / LOLZ_XF_SESSION_COOKIE пусты)"
-            ),
-            f"оффтоп: <code>forum_id={config.lolz_offtop_forum_id}</code>",
-        ]
-        await message.answer("\n".join(lines), parse_mode="HTML")
+    @router.message(Command("balance"))
+    async def cmd_balance(message: Message) -> None:
+        await _show_balance(message)
+
+    @router.message(Command("transfer"))
+    async def cmd_transfer(message: Message) -> None:
+        await _begin_transfer_open(message)
 
     # Plain text (NOT a ForceReply response, NOT a slash-command) — main-menu
     # reply-keyboard buttons. Slash-commands are intentionally excluded here so
@@ -136,21 +131,24 @@ def build_router(
         if text == CREATE_THREAD_BUTTON_TEXT:
             await _begin_create_thread(message)
             return
-        if text in VIEW_TOGGLE_BUTTON_TEXTS:
-            new_state = not (
-                viewer is not None and await viewer.is_enabled()
-            )
-            await _set_viewer(message, new_state)
+        if text in NOTIFS_TOGGLE_BUTTON_TEXTS:
+            new_state = not await store.is_notifications_enabled()
+            await _set_notifications(message, new_state)
+            return
+        if text == TRANSFER_BUTTON_TEXT:
+            await _begin_transfer_open(message)
+            return
+        if text == BALANCE_BUTTON_TEXT:
+            await _show_balance(message)
             return
         if text == HELP_BUTTON_TEXT:
             await message.answer(_help_text(), parse_mode="HTML")
             return
 
         # Otherwise — show the menu.
-        polling = await store.is_polling_enabled()
         await message.answer(
             "Не понял. Жми «❓ Команды» или /help.",
-            reply_markup=await _menu(polling),
+            reply_markup=await _menu(),
         )
 
     # ----- start / stop polling -----------------------------------------------
@@ -171,41 +169,63 @@ def build_router(
         await message.answer(
             f"▶ Оффтопим. Слежу за новыми темами в "
             f"{hd.link('разделе', config.lolz_offtop_url)} (после thread_id={baseline}).",
-            reply_markup=await _menu(True),
+            reply_markup=await _menu(),
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
 
     async def _stop_polling(message: Message) -> None:
         await store.set_polling_enabled(False)
-        await message.answer("⏹ Оффтоп остановлен.", reply_markup=await _menu(False))
+        await message.answer("⏹ Оффтоп остановлен.", reply_markup=await _menu())
 
-    async def _set_viewer(message: Message, new_state: bool) -> None:
-        if not viewer or not viewer.configured:
+    async def _set_notifications(message: Message, new_state: bool) -> None:
+        await store.set_notifications_enabled(new_state)
+        await message.answer(
+            (
+                "🔔 Уведомления включены. Буду присылать ответы, упоминания, комментарии и переводы."
+                if new_state
+                else "🔕 Уведомления выключены. Новых сообщений от форума присылать не буду."
+            ),
+            reply_markup=await _menu(),
+        )
+
+    async def _show_balance(message: Message) -> None:
+        try:
+            data = await lolz.get_balance()
+        except LolzApiError as e:
+            log.warning("get_balance failed: %s", e)
+            await message.answer(f"⚠ Не удалось получить баланс: {e}")
+            return
+        text = _format_balance(data)
+        await message.answer(text, parse_mode="HTML")
+
+    async def _begin_transfer_open(message: Message) -> None:
+        if not config.lolz_secret_answer:
             await message.answer(
-                "⚠ Куки сессии lolz не заданы (LOLZ_XF_USER_COOKIE / "
-                "LOLZ_XF_SESSION_COOKIE). Кнопка просмотра ничего не делает."
+                "⚠ Для переводов нужен <code>LOLZ_SECRET_ANSWER</code> "
+                "(секретный ответ из настроек безопасности на lolz). Добавь в ENV и перезапусти.",
+                parse_mode="HTML",
             )
             return
-        await viewer.set_enabled(new_state)
-        polling = await store.is_polling_enabled()
-        await message.answer(
-            "👀 Просмотр включён. Захожу в темы оффтопа под твоей сессией — "
-            "другие пользователи увидят тебя в списке «смотрят тему»."
-            if new_state
-            else "👀 Просмотр выключен.",
-            reply_markup=await _menu(polling),
+        prompt = await message.answer(
+            "💰 Кому и сколько перевести?\n"
+            "Формат: <code>@username сумма [комментарий]</code>\n"
+            "Например: <code>@HvHpasta 100 спасибо</code>",
+            parse_mode="HTML",
+            reply_markup=ForceReply(input_field_placeholder="@username сумма комментарий..."),
+        )
+        cancel_msg = await message.answer(
+            "Передумал?", reply_markup=cancel_kb(prompt.message_id)
+        )
+        await store.set_pending_transfer_username(
+            message.chat.id, prompt.message_id, cancel_message_id=cancel_msg.message_id
         )
 
-    async def _menu(polling: bool):
-        """Build the bottom keyboard, hiding optional rows when not configured."""
-        viewer_available = bool(viewer and viewer.configured)
-        viewer_enabled = await viewer.is_enabled() if viewer_available else False
-        return main_menu(
-            polling,
-            viewer_available=viewer_available,
-            viewer_enabled=viewer_enabled,
-        )
+    async def _menu():
+        """Build the bottom keyboard with current toggle states."""
+        polling = await store.is_polling_enabled()
+        notifs = await store.is_notifications_enabled()
+        return main_menu(polling, notifs_enabled=notifs)
 
     async def _begin_create_thread(message: Message) -> None:
         prompt = await message.answer(
@@ -292,7 +312,7 @@ def build_router(
         await _safe_delete(bot, cq.message.chat.id, prompt_msg_id)
         await _safe_delete(bot, cq.message.chat.id, cq.message.message_id)
         await cq.answer("❌ Отменено")
-        await _reattach_main_menu(bot, store, cq.message.chat.id, viewer=viewer)
+        await _reattach_main_menu(bot, store, cq.message.chat.id)
 
     # ----- profile / delete buttons -------------------------------------------
 
@@ -316,14 +336,120 @@ def build_router(
         if not user:
             await cq.message.answer("Профиль не найден.")
             return
-        text, avatar_url = _format_profile(user)
+        text, avatar_url, profile_url = _format_profile(user)
+        kb = profile_actions_kb(user_id, profile_url=profile_url)
         if avatar_url:
             try:
-                await cq.message.answer_photo(avatar_url, caption=text, parse_mode="HTML")
+                await cq.message.answer_photo(
+                    avatar_url, caption=text, parse_mode="HTML", reply_markup=kb,
+                )
                 return
             except TelegramBadRequest as e:
                 log.warning("profile photo failed: %s", e)
-        await cq.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+        await cq.message.answer(
+            text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb,
+        )
+
+    @router.callback_query(F.data == "balance")
+    async def cb_balance(cq: CallbackQuery) -> None:
+        if not cq.message:
+            await cq.answer()
+            return
+        await cq.answer("Проверяю…")
+        try:
+            data = await lolz.get_balance()
+        except LolzApiError as e:
+            await cq.message.answer(f"⚠ Не удалось получить баланс: {e}")
+            return
+        await cq.message.answer(_format_balance(data), parse_mode="HTML")
+
+    @router.callback_query(F.data.startswith("transfer:"))
+    async def cb_transfer(cq: CallbackQuery) -> None:
+        try:
+            _, user_id_str = cq.data.split(":", 1)
+            user_id = int(user_id_str)
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        if not config.lolz_secret_answer:
+            await cq.answer(
+                "⚠ Не задан LOLZ_SECRET_ANSWER — переводы отключены.",
+                show_alert=True,
+            )
+            return
+        prompt = await cq.message.answer(
+            f"💰 Сколько перевести юзеру #{user_id}?\n"
+            "Формат: <code>сумма [комментарий]</code>\n"
+            "Например: <code>100 спасибо за помощь</code>",
+            parse_mode="HTML",
+            reply_markup=ForceReply(input_field_placeholder="сумма [комментарий]..."),
+        )
+        cancel_msg = await cq.message.answer(
+            "Передумал?", reply_markup=cancel_kb(prompt.message_id)
+        )
+        await store.set_pending_transfer(
+            cq.message.chat.id, prompt.message_id, user_id,
+            cancel_message_id=cancel_msg.message_id,
+        )
+        await cq.answer()
+
+    @router.callback_query(F.data.startswith("wallpost:"))
+    async def cb_wallpost(cq: CallbackQuery) -> None:
+        try:
+            _, user_id_str = cq.data.split(":", 1)
+            user_id = int(user_id_str)
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        prompt = await cq.message.answer(
+            f"✍ Что написать на стене юзера #{user_id}?",
+            reply_markup=ForceReply(input_field_placeholder="Сообщение на стену..."),
+        )
+        cancel_msg = await cq.message.answer(
+            "Передумал?", reply_markup=cancel_kb(prompt.message_id)
+        )
+        await store.set_pending_wallpost(
+            cq.message.chat.id, prompt.message_id, user_id,
+            cancel_message_id=cancel_msg.message_id,
+        )
+        await cq.answer()
+
+    @router.callback_query(F.data.startswith("transfer_yes:"))
+    async def cb_transfer_yes(cq: CallbackQuery, bot: Bot) -> None:
+        if not cq.message:
+            await cq.answer()
+            return
+        key = (cq.message.chat.id, cq.message.message_id)
+        details = transfer_pending.pop(key, None)
+        if not details:
+            await cq.answer("Истекло время подтверждения.", show_alert=True)
+            return
+        try:
+            await lolz.transfer_money(
+                amount=details["amount"],
+                secret_answer=config.lolz_secret_answer,
+                user_id=details.get("user_id"),
+                username=details.get("username"),
+                comment=details.get("comment", ""),
+            )
+        except LolzApiError as e:
+            log.warning("transfer_money failed: %s", e)
+            await cq.answer(f"Ошибка: {e}", show_alert=True)
+            await _safe_delete(bot, cq.message.chat.id, cq.message.message_id)
+            return
+        recipient = details.get("username") or f"#{details.get('user_id')}"
+        await cq.answer("✅ Переведено")
+        await cq.message.edit_text(
+            f"✅ Переведено <b>{details['amount']:.2f} ₽</b> → "
+            f"<code>{hd.quote(str(recipient))}</code>",
+            parse_mode="HTML",
+        )
 
     @router.callback_query(F.data.startswith("delpost:"))
     async def cb_delpost(cq: CallbackQuery) -> None:
@@ -640,7 +766,7 @@ def build_router(
                 await _safe_delete(bot, message.chat.id, int(cancel_msg_id))
             await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
             await _safe_delete(bot, message.chat.id, message.message_id)
-            await _reattach_main_menu(bot, store, message.chat.id, viewer=viewer)
+            await _reattach_main_menu(bot, store, message.chat.id)
 
         try:
             if action == "create_body":
@@ -720,6 +846,72 @@ def build_router(
                     post_id=post_id,
                 )
                 await _finalize_force_reply()
+            elif action == "transfer_open":
+                # User typed "@username amount [comment]" — parse and ask for confirmation.
+                parsed = _parse_transfer_input(message.text or message.caption or "")
+                if parsed is None:
+                    await message.answer(
+                        "⚠ Не понял. Формат: <code>@username сумма [комментарий]</code>",
+                        parse_mode="HTML",
+                    )
+                    return
+                amount, username, comment = parsed
+                confirm = await message.answer(
+                    f"💰 Перевести <b>{amount:.2f} ₽</b> юзеру <code>@{hd.quote(username)}</code>?"
+                    + (f"\nКомментарий: {hd.quote(comment)}" if comment else ""),
+                    parse_mode="HTML",
+                    reply_markup=confirm_transfer_kb(
+                        yes_data="transfer_yes:open", no_data="noop"
+                    ),
+                )
+                transfer_pending[(confirm.chat.id, confirm.message_id)] = {
+                    "amount": amount,
+                    "username": username,
+                    "comment": comment,
+                }
+                await _finalize_force_reply()
+            elif action == "transfer":
+                # User typed "amount [comment]" for a known user_id — confirm.
+                target_user_id = int(pending.get("target_post_id") or 0)
+                parsed = _parse_amount_and_comment(message.text or message.caption or "")
+                if parsed is None or not target_user_id:
+                    await message.answer(
+                        "⚠ Не понял сумму. Пример: <code>100 спасибо</code>",
+                        parse_mode="HTML",
+                    )
+                    return
+                amount, comment = parsed
+                confirm = await message.answer(
+                    f"💰 Перевести <b>{amount:.2f} ₽</b> юзеру #{target_user_id}?"
+                    + (f"\nКомментарий: {hd.quote(comment)}" if comment else ""),
+                    parse_mode="HTML",
+                    reply_markup=confirm_transfer_kb(
+                        yes_data=f"transfer_yes:{target_user_id}", no_data="noop"
+                    ),
+                )
+                transfer_pending[(confirm.chat.id, confirm.message_id)] = {
+                    "amount": amount,
+                    "user_id": target_user_id,
+                    "comment": comment,
+                }
+                await _finalize_force_reply()
+            elif action == "wallpost":
+                target_user_id = int(pending.get("target_post_id") or 0)
+                if not target_user_id:
+                    await message.answer("⚠ Неизвестный юзер для стены.")
+                    return
+                pp_id = await lolz.create_profile_post(target_user_id, body)
+                if pp_id:
+                    url = f"https://lolz.live/profile-posts/{pp_id}/"
+                    await message.answer(
+                        f"✅ Сообщение отправлено на стену: {url}",
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    await message.answer(
+                        f"✅ Сообщение отправлено на стену юзера #{target_user_id}.",
+                    )
+                await _finalize_force_reply()
         except LolzApiError as e:
             log.exception("Force-reply action failed: %s", e)
             await message.answer(f"⚠ Ошибка lolz API: {e}")
@@ -774,8 +966,12 @@ async def _build_quoted_body(lolz: LolzClient, quote_post_id: int, my_body: str)
     return f"{head}\n{plain}\n[/QUOTE]\n\n{my_body}"
 
 
-def _format_profile(user: dict) -> tuple[str, str | None]:
-    """Render a lolz user dict into HTML for Telegram. Returns (text, avatar_url|None)."""
+def _format_profile(user: dict) -> tuple[str, str | None, str]:
+    """Render a lolz user dict into HTML for Telegram.
+
+    Returns ``(text, avatar_url|None, profile_url)``. The profile URL is
+    handed back to the caller so it can be wired into an inline button.
+    """
     username = str(user.get("username", "?"))
     user_id = int(user.get("user_id", 0) or 0)
     title = str(user.get("user_title") or "")
@@ -816,30 +1012,85 @@ def _format_profile(user: dict) -> tuple[str, str | None]:
         lines.append(f"📅 рег: {_fmt_ts(register_ts)}")
     if last_seen_ts:
         lines.append(f"👁 был: {_fmt_ts(last_seen_ts)}")
-    lines.append(f'🌐 <a href="{profile_url}">Открыть профиль</a>')
-    return "\n".join(lines), (avatar or None)
+    return "\n".join(lines), (avatar or None), profile_url
+
+
+def _format_balance(data: dict) -> str:
+    """Pretty-print whatever ``LolzClient.get_balance()`` returned.
+
+    Different lolz hosts surface the balance in different shapes — the
+    canonical one is ``{"balance": "1234.56 ₽", ...}`` but some return a
+    nested ``{currency: amount}`` map. We handle both.
+    """
+    if not data:
+        return "💼 Баланс пуст или недоступен."
+    # Most common: a single "balance" string.
+    bal = data.get("balance") or data.get("user_money") or data.get("user_balance")
+    if isinstance(bal, str) and bal.strip():
+        return f"💼 Баланс: <b>{hd.quote(bal.strip())}</b>"
+    if isinstance(bal, (int, float)):
+        return f"💼 Баланс: <b>{bal:.2f} ₽</b>"
+    # Some endpoints return per-currency dicts: {"rub": 100, "usd": 5}
+    parts: list[str] = []
+    for k, v in data.items():
+        if k in {"raw", "links", "permissions"}:
+            continue
+        if isinstance(v, (int, float, str)) and str(v).strip():
+            parts.append(f"{hd.quote(str(k))}: <b>{hd.quote(str(v))}</b>")
+    if parts:
+        return "💼 Баланс\n" + "\n".join(parts)
+    return "💼 Баланс не определён."
+
+
+def _parse_transfer_input(text: str) -> tuple[float, str, str] | None:
+    """Parse ``@username 100 [комментарий]`` → ``(amount, username, comment)``."""
+    import re as _re
+
+    m = _re.match(
+        r"\s*@?(?P<u>[A-Za-z0-9_А-Яа-яёЁ\-\.]+)\s+(?P<a>[\d.,]+)\s*(?P<c>.*)",
+        text or "",
+        _re.DOTALL,
+    )
+    if not m:
+        return None
+    try:
+        amount = float(m.group("a").replace(",", "."))
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    return amount, m.group("u").strip(), m.group("c").strip()
+
+
+def _parse_amount_and_comment(text: str) -> tuple[float, str] | None:
+    """Parse ``100 [комментарий]`` → ``(amount, comment)``."""
+    import re as _re
+
+    m = _re.match(r"\s*(?P<a>[\d.,]+)\s*(?P<c>.*)", text or "", _re.DOTALL)
+    if not m:
+        return None
+    try:
+        amount = float(m.group("a").replace(",", "."))
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    return amount, m.group("c").strip()
 
 
 async def _reattach_main_menu(
     bot: Bot,
     store: Store,
     chat_id: int,
-    *,
-    viewer: Viewer | None = None,
 ) -> None:
     """Send a tiny confirmation that re-attaches the persistent reply keyboard."""
     polling = await store.is_polling_enabled()
-    viewer_available = bool(viewer and viewer.configured)
-    viewer_enabled = await viewer.is_enabled() if viewer_available else False
+    notifs = await store.is_notifications_enabled()
     try:
         await bot.send_message(
             chat_id,
             "✅ Готово.",
-            reply_markup=main_menu(
-                polling,
-                viewer_available=viewer_available,
-                viewer_enabled=viewer_enabled,
-            ),
+            reply_markup=main_menu(polling, notifs_enabled=notifs),
         )
     except TelegramBadRequest as e:
         log.warning("reattach main menu failed: %s", e)
@@ -859,12 +1110,16 @@ def _help_text() -> str:
         "  /offtop_off — приостановить",
         "  /new_thread — создать тему (запросит заголовок)",
         "",
-        "<b>Просмотр (HTML+cookies)</b>",
-        "  /view_on, /view_off — захожу под твоей сессией в темы оффтопа",
-        "  /view_status — состояние и наличие кук",
+        "<b>Уведомления и финансы</b>",
+        "  /notifs_on, /notifs_off — вкл/выкл уведомлений с форума",
+        "  /balance — размер баланса кошелька",
+        "  /transfer — перевести деньги юзеру (требует LOLZ_SECRET_ANSWER)",
         "",
         "<b>Кнопки</b>",
-        "  ▶/⏹ Оффтопить · 👀 Просмотр · 📝 Создать тему · ❓ Команды",
+        "  ▶/⏹ Оффтопить · 💰 Перевести · 💼 Баланс · 📝 Новая тема · 🔔/🔕 Уведомления · ❓ Команды",
+        "",
+        "<b>На профиле юзера</b>",
+        "  💰 Перевести деньги · ✍ Написать на стене · 💼 Мой баланс",
     ]
     return "\n".join(lines)
 

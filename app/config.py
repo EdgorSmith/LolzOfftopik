@@ -30,14 +30,9 @@ class Config:
     http_port: int
     db_path: str
     public_url: str  # e.g. "https://lolzofftopik.onrender.com" — used to host attachments for replies
-    # Browser-fingerprinted "view" mode — hits HTML thread pages on lolz.live
-    # with the user's session cookies, so XenForo's "members currently
-    # viewing this thread" widget shows them as present. Disabled if the
-    # required cookies are empty.
-    lolz_web_base: str
-    lolz_xf_user_cookie: str
-    lolz_xf_session_cookie: str
-    lolz_xf_csrf_cookie: str
+    # Optional secret-answer for /payments/transfer. Without it the
+    # "💰 Перевести деньги" flow refuses to send anything.
+    lolz_secret_answer: str
 
     @classmethod
     def from_env(cls) -> Config:
@@ -58,8 +53,5 @@ class Config:
             http_port=int(os.environ.get("PORT", "10000")),
             db_path=os.environ.get("DB_PATH", "data/state.sqlite3"),
             public_url=public_url,
-            lolz_web_base=os.environ.get("LOLZ_WEB_BASE", "https://lolz.live").rstrip("/"),
-            lolz_xf_user_cookie=os.environ.get("LOLZ_XF_USER_COOKIE", "").strip(),
-            lolz_xf_session_cookie=os.environ.get("LOLZ_XF_SESSION_COOKIE", "").strip(),
-            lolz_xf_csrf_cookie=os.environ.get("LOLZ_XF_CSRF_COOKIE", "").strip(),
+            lolz_secret_answer=os.environ.get("LOLZ_SECRET_ANSWER", "").strip(),
         )

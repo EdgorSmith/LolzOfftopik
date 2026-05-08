@@ -145,19 +145,40 @@ def _replace_smileys_with_shortcodes(post_body_html: str) -> str:
 
 
 def render_text_for_telegram(post_body_html: str, max_len: int = 3500) -> str:
-    """Best-effort plain-text render of a post body, with line breaks preserved."""
+    """Best-effort plain-text render of a post body, with line breaks preserved.
+
+    XenForo "smart links" expand a URL into a nested ``<div>`` block that
+    renders as a wall of indented whitespace once tags are stripped. We
+    aggressively collapse internal whitespace per-line and cap consecutive
+    blank lines so links don't push real content off-screen.
+    """
     if not post_body_html:
         return ""
+    # Drop the XenForo "smart link" preview wrappers entirely — they re-render
+    # the linked thread's title/forum/timestamp as a nested block, which is
+    # noise for our card. The bare URL stays in the surrounding <a> tag.
+    s = re.sub(
+        r"(?is)<div[^>]*\b(?:js-unfurl|js-thread-link|bbCodeBlock|messageAttribution)[^>]*>.*?</div>",
+        " ",
+        post_body_html,
+    )
     # Replace smiley images with their shortcodes so they survive stripping.
-    s = _replace_smileys_with_shortcodes(post_body_html)
+    s = _replace_smileys_with_shortcodes(s)
     # Normalize <br> and block-ish closers to newlines before stripping tags.
     s = re.sub(r"(?i)<br\s*/?>", "\n", s)
     s = re.sub(r"(?i)</p>", "\n\n", s)
     s = re.sub(r"(?i)</div>", "\n", s)
+    s = re.sub(r"(?i)</li>", "\n", s)
+    s = re.sub(r"(?i)</tr>", "\n", s)
     tree = HTMLParser(s)
     text = tree.text(separator="").strip()
     text = html.unescape(text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Per-line whitespace cleanup: drop runs of internal spaces, then trim each
+    # line. This is what kills the giant indented gap that smart-link previews
+    # leave behind.
+    lines = [re.sub(r"[ \t\u00a0]+", " ", ln).strip() for ln in text.split("\n")]
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if len(text) > max_len:
         text = text[: max_len - 1].rstrip() + "…"
     return text

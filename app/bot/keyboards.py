@@ -7,34 +7,42 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardBu
 START_BUTTON_TEXT = "▶ Начать оффтопить"
 STOP_BUTTON_TEXT = "⏹ Окончить оффтоп"
 CREATE_THREAD_BUTTON_TEXT = "📝 Создать тему"
-VIEW_ON_BUTTON_TEXT = "👀 Просмотр: вкл"
-VIEW_OFF_BUTTON_TEXT = "👀 Просмотр: выкл"
+TRANSFER_BUTTON_TEXT = "💰 Перевести деньги"
+BALANCE_BUTTON_TEXT = "💼 Мой баланс"
+NOTIFS_ON_BUTTON_TEXT = "🔔 Уведомления: вкл"
+NOTIFS_OFF_BUTTON_TEXT = "🔕 Уведомления: выкл"
 HELP_BUTTON_TEXT = "❓ Команды"
 # Either label triggers the toggle handler.
-VIEW_TOGGLE_BUTTON_TEXTS = (VIEW_ON_BUTTON_TEXT, VIEW_OFF_BUTTON_TEXT)
+NOTIFS_TOGGLE_BUTTON_TEXTS = (NOTIFS_ON_BUTTON_TEXT, NOTIFS_OFF_BUTTON_TEXT)
 
 
 def main_menu(
     polling_enabled: bool,
     *,
-    viewer_available: bool = False,
-    viewer_enabled: bool = False,
+    notifs_enabled: bool = True,
 ) -> ReplyKeyboardMarkup:
     """Bottom reply keyboard.
 
-    The Viewer row is rendered only when ``viewer_available`` is true (i.e.
-    session cookies are configured). Without cookies the row is hidden so
-    the user doesn't see a button that does nothing.
+    Layout:
+      [▶ / ⏹ оффтоп]
+      [💰 Перевести]   [💼 Мой баланс]
+      [📝 Создать тему] [🔔/🔕 Уведомления]
+      [❓ Команды]
     """
     poll_label = STOP_BUTTON_TEXT if polling_enabled else START_BUTTON_TEXT
-    view_label = VIEW_ON_BUTTON_TEXT if viewer_enabled else VIEW_OFF_BUTTON_TEXT
-    rows = [[KeyboardButton(text=poll_label)]]
-    if viewer_available:
-        rows.append([KeyboardButton(text=view_label)])
-    rows.append([
-        KeyboardButton(text=CREATE_THREAD_BUTTON_TEXT),
-        KeyboardButton(text=HELP_BUTTON_TEXT),
-    ])
+    notif_label = NOTIFS_ON_BUTTON_TEXT if notifs_enabled else NOTIFS_OFF_BUTTON_TEXT
+    rows = [
+        [KeyboardButton(text=poll_label)],
+        [
+            KeyboardButton(text=TRANSFER_BUTTON_TEXT),
+            KeyboardButton(text=BALANCE_BUTTON_TEXT),
+        ],
+        [
+            KeyboardButton(text=CREATE_THREAD_BUTTON_TEXT),
+            KeyboardButton(text=notif_label),
+        ],
+        [KeyboardButton(text=HELP_BUTTON_TEXT)],
+    ]
     return ReplyKeyboardMarkup(
         keyboard=rows,
         resize_keyboard=True,
@@ -110,3 +118,73 @@ def confirm_kb(yes_data: str, no_data: str = "noop") -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗑 Да, удалить", callback_data=yes_data),
         ]]
     )
+
+
+def confirm_transfer_kb(yes_data: str, no_data: str = "noop") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data=no_data),
+            InlineKeyboardButton(text="✅ Перевести", callback_data=yes_data),
+        ]]
+    )
+
+
+def profile_actions_kb(user_id: int, *, profile_url: str | None = None) -> InlineKeyboardMarkup:
+    """Action menu shown under a user's profile card.
+
+    Lets the bot owner transfer money to that user, leave a profile-post on
+    their wall, check their own balance, or open the profile page on lolz.
+    """
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="💰 Перевести деньги", callback_data=f"transfer:{user_id}"),
+            InlineKeyboardButton(text="✍ На стене", callback_data=f"wallpost:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="💼 Мой баланс", callback_data="balance"),
+        ],
+    ]
+    if profile_url:
+        rows[1].append(InlineKeyboardButton(text="🌐 Открыть", url=profile_url))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def comment_notif_kb(post_id: int, *, creator_user_id: int = 0) -> InlineKeyboardMarkup:
+    """Keyboard under a "X прокомментировал/упомянул/ответил" notification."""
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="↩ Ответить", callback_data=f"creply:{post_id}"),
+            InlineKeyboardButton(text="🌐 Открыть", url=f"https://lolz.live/posts/{post_id}/"),
+        ],
+    ]
+    if creator_user_id:
+        rows.append(
+            [InlineKeyboardButton(text="👤 Профиль", callback_data=f"profile:{creator_user_id}")]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def post_notif_kb(post_id: int, *, creator_user_id: int = 0) -> InlineKeyboardMarkup:
+    """Keyboard under a regular post notification (reply / mention / quote)."""
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="🌐 Открыть", url=f"https://lolz.live/posts/{post_id}/"),
+        ],
+    ]
+    if creator_user_id:
+        rows[0].insert(
+            0, InlineKeyboardButton(text="👤 Профиль", callback_data=f"profile:{creator_user_id}")
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def generic_notif_kb(url: str, *, creator_user_id: int = 0) -> InlineKeyboardMarkup:
+    """Keyboard under non-post notifications (profile_post / payment / follow / …)."""
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="🌐 Открыть", url=url)],
+    ]
+    if creator_user_id:
+        rows[0].insert(
+            0, InlineKeyboardButton(text="👤 Профиль", callback_data=f"profile:{creator_user_id}")
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
