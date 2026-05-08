@@ -18,9 +18,10 @@ import re
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup
 from selectolax.parser import HTMLParser
 
+from app.bot.keyboards import comment_notif_kb, generic_notif_kb, post_notif_kb
 from app.config import Config
 from app.db import Store
 from app.lolz import LolzClient
@@ -29,6 +30,13 @@ from app.lolz.client import LolzApiError
 log = logging.getLogger(__name__)
 
 _SETTING_KEY = "last_notification_id"
+# Forum-side placeholder text rendered when the viewer doesn't have access to
+# a [HIDE]…[/HIDE] block. We try to recover the real content via API when we
+# spot any of these markers.
+_HIDDEN_PLACEHOLDER_RE = re.compile(
+    r"\[?\s*(?:скрыт(?:ый|ое|ого)\s+(?:контент|сообщение)|hidden\s+content)\s*\]?",
+    re.IGNORECASE,
+)
 
 # Things that look like money in a notification body. We use this both to pick
 # a wallet emoji and to surface the amount in the title line.
@@ -103,25 +111,31 @@ class NotifPoller:
         # Send oldest-first.
         new_ones.sort(key=lambda n: int(n.get("notification_id") or 0))
 
+        # Respect the user-controlled notifications toggle. We still advance
+        # the high-water mark while disabled so re-enabling doesn't dump the
+        # whole missed backlog at once.
+        notifications_enabled = await self._store.is_notifications_enabled()
+
         for n in new_ones:
             nid = int(n.get("notification_id") or 0)
-            try:
-                classified = await self._classify(n)
-                if classified is not None:
-                    await self._send_one(n, classified)
-                else:
-                    log.info(
-                        "Skip notification %s (%s/%s) — not for me",
-                        nid,
-                        n.get("content_type"),
-                        n.get("content_action"),
-                    )
-            except TelegramBadRequest as e:
-                # Don't get stuck retrying a malformed notification — record it
-                # as seen and move on.
-                log.warning("Failed to deliver notification %s: %s", nid, e)
-            except Exception:  # noqa: BLE001
-                log.exception("Notification %s processing failed", nid)
+            if notifications_enabled:
+                try:
+                    classified = await self._classify(n)
+                    if classified is not None:
+                        await self._send_one(n, classified)
+                    else:
+                        log.info(
+                            "Skip notification %s (%s/%s) — not for me",
+                            nid,
+                            n.get("content_type"),
+                            n.get("content_action"),
+                        )
+                except TelegramBadRequest as e:
+                    # Don't get stuck retrying a malformed notification — record
+                    # it as seen and move on.
+                    log.warning("Failed to deliver notification %s: %s", nid, e)
+                except Exception:  # noqa: BLE001
+                    log.exception("Notification %s processing failed", nid)
             if nid > last_seen:
                 last_seen = nid
                 await self._store.set_setting(_SETTING_KEY, str(last_seen))
@@ -142,9 +156,17 @@ class NotifPoller:
             # Any post-comment notification (your_post / tag / reply / mention /
             # quote) — extract the comment body and parent post_id from the
             # ready-made HTML preview.
-            body, post_id = _parse_comment_html(
+            body, post_id, comment_id = _parse_comment_html(
                 n.get("notification_html") or "", my_username
             )
+            # If the rendered preview hides content ("[Скрытый контент]")
+            # we have authenticated access to the parent post, so we can
+            # fetch the comment list and pull the real text. Same trick
+            # works for cases where the preview was truncated to ~200 chars.
+            if post_id and (_HIDDEN_PLACEHOLDER_RE.search(body) or len(body) >= 195):
+                full = await self._fetch_full_comment(post_id, comment_id)
+                if full:
+                    body = full
             return {
                 "reason": "post_comment",
                 "body": body,
@@ -172,6 +194,8 @@ class NotifPoller:
             return None
 
         body_bb = post.get("post_body") or ""
+        # post_body comes from the API authenticated as us — [HIDE] blocks
+        # are already unwrapped if we have permission to read them.
         body_text = _strip_bbcode(body_bb)
 
         thread = post.get("thread") or {}
@@ -184,6 +208,39 @@ class NotifPoller:
         ):
             return {"reason": "mention", "body": body_text, "post_id": post_id, "action": action}
         return None
+
+    async def _fetch_full_comment(self, post_id: int, comment_id: int) -> str:
+        """Recover the real comment body via the API.
+
+        bdApi returns ``comment_body`` (BBCode) and ``comment_body_html`` for
+        each comment; either is good for a preview. The API call is
+        authenticated as us, so [HIDE] blocks visible to us are unwrapped.
+        """
+        try:
+            comments = await self._lolz.list_post_comments(post_id, limit=20)
+        except LolzApiError as e:
+            log.info("list_post_comments(%s) failed: %s", post_id, e)
+            return ""
+        match = None
+        if comment_id:
+            for c in comments:
+                if int(c.get("post_comment_id") or c.get("comment_id") or 0) == comment_id:
+                    match = c
+                    break
+        if not match and comments:
+            # Newest first; first is usually the one that triggered the notif.
+            match = comments[0]
+        if not match:
+            return ""
+        body = (
+            match.get("comment_body")
+            or match.get("post_comment_body")
+            or match.get("comment_body_html")
+            or ""
+        )
+        if "<" in body:
+            return _strip_html_to_text(body)
+        return _strip_bbcode(body)
 
     async def _send_one(self, n: dict, classified: dict) -> None:
         text = _format(n, classified)
@@ -203,23 +260,19 @@ class NotifPoller:
 
 
 def _kb_for(n: dict, classified: dict) -> InlineKeyboardMarkup | None:
-    rows: list[list[InlineKeyboardButton]] = []
     reason = classified.get("reason")
     post_id = int(classified.get("post_id") or 0)
+    creator_user_id = int(n.get("creator_user_id") or 0)
 
     if reason == "post_comment" and post_id:
-        rows.append([
-            InlineKeyboardButton(text="↩ Ответить", callback_data=f"creply:{post_id}"),
-            InlineKeyboardButton(text="🌐 Открыть",
-                                 url=f"https://lolz.live/posts/{post_id}/"),
-        ])
-        return InlineKeyboardMarkup(inline_keyboard=rows)
+        return comment_notif_kb(post_id, creator_user_id=creator_user_id)
+    if reason in {"my_thread", "quote", "mention"} and post_id:
+        return post_notif_kb(post_id, creator_user_id=creator_user_id)
 
     url = _link_for(n)
     if not url:
         return None
-    rows.append([InlineKeyboardButton(text="🌐 Открыть", url=url)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return generic_notif_kb(url, creator_user_id=creator_user_id)
 
 
 def _link_for(n: dict) -> str:
@@ -237,14 +290,22 @@ def _link_for(n: dict) -> str:
 
 
 def _format(n: dict, classified: dict) -> str:
-    """Render a single notification as a TG HTML message."""
+    """Render a single notification as a TG HTML message.
+
+    The header line is the canonical "emoji + username + action" summary;
+    underneath it we render the actual content of the post / comment /
+    profile-post / payment so the user doesn't have to open the forum just
+    to know what was said.
+    """
     creator = html.escape(str(n.get("creator_username") or "?"))
     icon, action = _label(n, classified)
     body = (classified.get("body") or "").strip()
     head = f"{icon} <b>{creator}</b> {action}".rstrip()
     if body:
-        snippet = body if len(body) <= 600 else body[:600].rstrip() + "…"
-        return f"{head}\n\n<i>{html.escape(snippet)}</i>"
+        # Cap the inline preview so a long thread reply doesn't blow past
+        # Telegram's 4096-char message limit; full content is one tap away.
+        snippet = body if len(body) <= 1500 else body[:1500].rstrip() + "…"
+        return f"{head}\n\n<blockquote>{html.escape(snippet)}</blockquote>"
     return head
 
 
@@ -317,19 +378,25 @@ def _strip_html_to_text(notif_html: str) -> str:
     return text.strip()
 
 
-def _parse_comment_html(notif_html: str, my_username: str) -> tuple[str, int]:
-    """Pull the comment body and parent post_id out of ``notification_html``.
+def _parse_comment_html(notif_html: str, my_username: str) -> tuple[str, int, int]:
+    """Pull comment body, parent post_id and comment_id out of ``notification_html``.
 
     Lolz includes a ready-to-render snippet that already contains the comment
     text after a ``<br>`` tag, plus a ``/posts/{post_id}/preview`` link. We
     parse both with selectolax and fall back to regex on the raw HTML.
     """
     if not notif_html:
-        return "", 0
+        return "", 0, 0
 
     # Parent post_id from /posts/<id>/preview link.
     m = re.search(r"/posts/(\d+)/preview", notif_html)
     post_id = int(m.group(1)) if m else 0
+    # Comment id (when present) — usually surfaced as data attribute or in
+    # /posts/comments/<id> links.
+    cm = re.search(r"/(?:posts/comments|post-comments)/(\d+)", notif_html)
+    if not cm:
+        cm = re.search(r"data-(?:post-)?comment-id=\"(\d+)\"", notif_html)
+    comment_id = int(cm.group(1)) if cm else 0
 
     # The comment body is the part after the first <br>.
     parts = re.split(r"<br\s*/?>", notif_html, maxsplit=1)
@@ -344,4 +411,4 @@ def _parse_comment_html(notif_html: str, my_username: str) -> tuple[str, int]:
         )
         if prefix:
             text = text[prefix.end():]
-    return text, post_id
+    return text, post_id, comment_id

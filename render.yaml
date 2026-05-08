@@ -22,11 +22,5 @@ services:
         sync: false
       - key: LOLZ_API_TOKEN
         sync: false
-      - key: LOLZ_WEB_BASE
-        value: https://lolz.live
-      - key: LOLZ_XF_USER_COOKIE
-        sync: false
-      - key: LOLZ_XF_SESSION_COOKIE
-        sync: false
-      - key: LOLZ_XF_CSRF_COOKIE
+      - key: LOLZ_SECRET_ANSWER
         sync: false

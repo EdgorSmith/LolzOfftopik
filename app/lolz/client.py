@@ -134,6 +134,21 @@ class LolzClient:
         data = await self._request("GET", "/posts", params=params)
         return list(data.get("posts") or [])
 
+    async def list_post_comments(
+        self,
+        post_id: int,
+        *,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Fetch comments under a post. Used to recover the real text of a
+        comment notification when the rendered preview is truncated or
+        replaced with ``[Скрытый контент]``.
+        """
+        data = await self._request(
+            "GET", f"/posts/{post_id}/comments", params={"limit": limit}
+        )
+        return list(data.get("comments") or [])
+
     # ----- posts ---------------------------------------------------------------
 
     async def reply(self, thread_id: int, body: str) -> int:
@@ -229,6 +244,92 @@ class LolzClient:
             f"/users/{user_id}/timeline",
             params={"page": page, "limit": limit},
         )
+
+    # ----- payments / wallet ---------------------------------------------------
+
+    async def get_balance(self) -> dict:
+        """Read my own forum/market balance.
+
+        Tries ``/payments/balance`` first (returns multiple currencies on
+        lolz prod-api), then falls back to ``/users/me`` and reads the
+        ``user_money`` / ``user_balance`` fields. Returns a dict like
+        ``{"balance": "1234.56 ₽", "raw": {...}}``.
+        """
+        try:
+            data = await self._request("GET", "/payments/balance")
+        except LolzApiError as e:
+            log.info("/payments/balance unavailable (%s); falling back to /users/me", e)
+            data = None
+        if data:
+            return data
+
+        me = await self.me()
+        balance = (
+            me.get("user_money")
+            or me.get("user_balance")
+            or me.get("user_balance_format")
+            or me.get("user_balance_short")
+            or ""
+        )
+        return {"balance": balance, "raw": me}
+
+    async def transfer_money(
+        self,
+        *,
+        amount: float,
+        secret_answer: str,
+        user_id: int | None = None,
+        username: str | None = None,
+        comment: str = "",
+        transfer_hold: int | bool = False,
+        currency: str = "rub",
+    ) -> dict:
+        """Transfer ``amount`` rubles to ``user_id`` / ``username``.
+
+        ``secret_answer`` is your forum security-question answer
+        (configured in ``LOLZ_SECRET_ANSWER``). ``transfer_hold`` of 1 / 2
+        applies a 24h / 48h hold; ``False`` / ``0`` sends instantly.
+
+        The endpoint is ``POST /payments/transfer`` on the bdApi base; if
+        the host returns 404 we retry against the canonical zelenka market
+        host. Both speak the same form-encoded contract.
+        """
+        if not user_id and not username:
+            raise ValueError("transfer_money: user_id or username is required")
+        payload: dict = {
+            "amount": amount,
+            "secret_answer": secret_answer,
+            "currency": currency,
+        }
+        if user_id:
+            payload["user_id"] = user_id
+        if username:
+            payload["username"] = username
+        if comment:
+            payload["comment"] = comment
+        if transfer_hold:
+            payload["transfer_hold"] = int(transfer_hold) if transfer_hold is not True else 1
+        try:
+            return await self._request("POST", "/payments/transfer", data=payload)
+        except LolzApiError as e:
+            if e.status != 404:
+                raise
+            # Some lolz API hosts mount payments under /zelenka/payments/transfer.
+            return await self._request("POST", "/zelenka/payments/transfer", data=payload)
+
+    # ----- profile posts (wall comments) --------------------------------------
+
+    async def create_profile_post(self, user_id: int, body: str) -> int:
+        """Post a message on ``user_id``'s profile wall. Returns the new
+        ``profile_post_id`` (0 if the API didn't echo it back).
+        """
+        data = await self._request(
+            "POST",
+            "/profile-posts",
+            data={"user_id": user_id, "post_body": body},
+        )
+        pp = data.get("profile_post") or {}
+        return int(pp.get("profile_post_id", 0) or 0)
 
 
 class LolzApiError(RuntimeError):

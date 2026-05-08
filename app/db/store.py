@@ -149,6 +149,16 @@ class Store:
     async def set_polling_enabled(self, value: bool) -> None:
         await self.set_setting("polling_enabled", "1" if value else "0")
 
+    async def is_notifications_enabled(self) -> bool:
+        # Default ON — most users will want notifications enabled out of the
+        # box; the toggle exists so they can mute the feed without losing
+        # their high-water mark.
+        v = await self.get_setting("notifications_enabled")
+        return v != "0"
+
+    async def set_notifications_enabled(self, value: bool) -> None:
+        await self.set_setting("notifications_enabled", "1" if value else "0")
+
     async def get_baseline_thread_id(self) -> int:
         v = await self.get_setting("baseline_thread_id")
         return int(v) if v else 0
@@ -318,6 +328,59 @@ class Store:
             card_chat_id=chat_id,
             card_message_id=prompt_message_id,
             payload=title,
+            cancel_message_id=cancel_message_id,
+        )
+
+    async def set_pending_transfer(
+        self,
+        chat_id: int,
+        prompt_message_id: int,
+        recipient_user_id: int,
+        cancel_message_id: int | None = None,
+    ) -> None:
+        """User must enter ``<amount> [comment...]`` for a money transfer."""
+        await self._set_pending(
+            chat_id, prompt_message_id, "transfer",
+            target_thread_id=None,
+            target_post_id=int(recipient_user_id),
+            card_chat_id=chat_id,
+            card_message_id=prompt_message_id,
+            payload=None,
+            cancel_message_id=cancel_message_id,
+        )
+
+    async def set_pending_transfer_username(
+        self,
+        chat_id: int,
+        prompt_message_id: int,
+        cancel_message_id: int | None = None,
+    ) -> None:
+        """Top-level "💰 Перевести деньги" entry-point: ask for ``@user amount [comment]``."""
+        await self._set_pending(
+            chat_id, prompt_message_id, "transfer_open",
+            target_thread_id=None,
+            target_post_id=None,
+            card_chat_id=chat_id,
+            card_message_id=prompt_message_id,
+            payload=None,
+            cancel_message_id=cancel_message_id,
+        )
+
+    async def set_pending_wallpost(
+        self,
+        chat_id: int,
+        prompt_message_id: int,
+        target_user_id: int,
+        cancel_message_id: int | None = None,
+    ) -> None:
+        """User must enter the body of a profile-wall post."""
+        await self._set_pending(
+            chat_id, prompt_message_id, "wallpost",
+            target_thread_id=None,
+            target_post_id=int(target_user_id),
+            card_chat_id=chat_id,
+            card_message_id=prompt_message_id,
+            payload=None,
             cancel_message_id=cancel_message_id,
         )
 

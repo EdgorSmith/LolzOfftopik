@@ -19,7 +19,6 @@ from app.health import run_http_server
 from app.lolz import LolzClient
 from app.notif_poller import NotifPoller
 from app.poller import Poller
-from app.viewer import Viewer
 
 
 async def amain() -> None:
@@ -51,15 +50,7 @@ async def amain() -> None:
     )
     dp = Dispatcher()
 
-    viewer = Viewer(config, store, lolz, bot)
-    if viewer.configured:
-        viewer.start()
-    else:
-        logging.getLogger(__name__).info(
-            "Viewer disabled: LOLZ_XF_USER_COOKIE / LOLZ_XF_SESSION_COOKIE not set."
-        )
-
-    dp.include_router(build_router(config, store, lolz, viewer=viewer))
+    dp.include_router(build_router(config, store, lolz))
 
     poller = Poller(config, store, lolz, bot)
     poller.start()
@@ -97,7 +88,6 @@ async def amain() -> None:
             pass
         await poller.stop()
         await notif_poller.stop()
-        await viewer.stop()
         await lolz.close()
         await bot.session.close()
         await http_runner.cleanup()
