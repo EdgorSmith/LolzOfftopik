@@ -25,6 +25,7 @@ from app.bot.keyboards import (
     CREATE_THREAD_BUTTON_TEXT,
     HELP_BUTTON_TEXT,
     NOTIFS_TOGGLE_BUTTON_TEXTS,
+    PM_BUTTON_TEXT,
     START_BUTTON_TEXT,
     STOP_BUTTON_TEXT,
     TRANSFER_BUTTON_TEXT,
@@ -32,6 +33,8 @@ from app.bot.keyboards import (
     confirm_kb,
     confirm_transfer_kb,
     main_menu,
+    pm_list_kb,
+    pm_view_kb,
     profile_actions_kb,
     reply_like_kb,
     thread_card_kb,
@@ -110,6 +113,20 @@ def build_router(
     async def cmd_transfer(message: Message) -> None:
         await _begin_transfer_open(message)
 
+    @router.message(Command("pm", "messages"))
+    async def cmd_pm(message: Message, bot: Bot) -> None:
+        await _show_pm_list(bot, message.chat.id, page=1)
+
+    @router.message(Command("dice"))
+    async def cmd_dice(message: Message) -> None:
+        """Roll a Telegram dice (1–6) and announce the result in chat."""
+        sent = await message.answer_dice(emoji="\U0001F3B2")
+        value = sent.dice.value if sent.dice else 0
+        await message.answer(
+            f"\U0001F3B2 Выпало: <b>{value}</b>",
+            parse_mode="HTML",
+        )
+
     # Plain text (NOT a ForceReply response, NOT a slash-command) — main-menu
     # reply-keyboard buttons. Slash-commands are intentionally excluded here so
     # they fall through to their dedicated Command() handlers below; otherwise
@@ -132,6 +149,9 @@ def build_router(
             return
         if text == TRANSFER_BUTTON_TEXT:
             await _begin_transfer_open(message)
+            return
+        if text == PM_BUTTON_TEXT:
+            await _show_pm_list(bot, message.chat.id, page=1)
             return
         if text == HELP_BUTTON_TEXT:
             await message.answer(_help_text(), parse_mode="HTML")
@@ -221,6 +241,70 @@ def build_router(
         )
         await store.set_pending_create_title(
             message.chat.id, prompt.message_id, cancel_message_id=cancel_msg.message_id
+        )
+
+    # ----- private messages (conversations) ----------------------------------
+
+    async def _show_pm_list(bot: Bot, chat_id: int, *, page: int = 1) -> None:
+        """Send / refresh the conversations list. Used by /pm and the menu button."""
+        try:
+            data = await lolz.list_conversations(folder="all", page=page, limit=10)
+        except LolzApiError as e:
+            log.warning("list_conversations failed: %s", e)
+            await bot.send_message(
+                chat_id,
+                f"⚠ Не удалось получить диалоги: {e}",
+            )
+            return
+        items, has_more = _summarize_conversations(data)
+        if not items:
+            text = "📬 Нет личных сообщений."
+        else:
+            text = "📬 <b>Диалоги</b>\nВыбери диалог, чтобы прочитать и ответить."
+        await bot.send_message(
+            chat_id,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=pm_list_kb(items, page=page, has_more=has_more),
+        )
+
+    async def _show_pm_view(
+        bot: Bot,
+        chat_id: int,
+        conversation_id: int,
+        *,
+        page: int = 1,
+    ) -> None:
+        """Render recent messages of a single conversation."""
+        try:
+            messages = await lolz.list_conversation_messages(
+                conversation_id, page=page, limit=10, order="natural_reverse"
+            )
+        except LolzApiError as e:
+            log.warning("list_conversation_messages failed: %s", e)
+            await bot.send_message(
+                chat_id,
+                f"⚠ Не удалось получить сообщения: {e}",
+            )
+            return
+        try:
+            conv = await lolz.get_conversation(conversation_id)
+        except LolzApiError:
+            conv = {}
+        title = (
+            conv.get("conversation_title")
+            or conv.get("title")
+            or f"Диалог #{conversation_id}"
+        )
+        text = _format_pm_messages(title, conversation_id, messages)
+        has_more = len(messages) >= 10
+        await bot.send_message(
+            chat_id,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=pm_view_kb(conversation_id, page=page, has_more=has_more),
         )
 
     # ----- inline buttons: like / reply / edit --------------------------------
@@ -333,6 +417,106 @@ def build_router(
         await cq.message.answer(
             text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb,
         )
+
+    # ----- PM inline callbacks ------------------------------------------------
+
+    @router.callback_query(F.data.startswith("pmlist:"))
+    async def cb_pm_list(cq: CallbackQuery, bot: Bot) -> None:
+        try:
+            _, page_str = cq.data.split(":", 1)
+            page = max(1, int(page_str))
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        await cq.answer()
+        await _show_pm_list(bot, cq.message.chat.id, page=page)
+
+    @router.callback_query(F.data.startswith("pmview:"))
+    async def cb_pm_view(cq: CallbackQuery, bot: Bot) -> None:
+        try:
+            _, conv_id_str, page_str = cq.data.split(":", 2)
+            conv_id = int(conv_id_str)
+            page = max(1, int(page_str))
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        await cq.answer("Гружу диалог…")
+        await _show_pm_view(bot, cq.message.chat.id, conv_id, page=page)
+
+    @router.callback_query(F.data.startswith("pmreply:"))
+    async def cb_pm_reply(cq: CallbackQuery) -> None:
+        try:
+            _, conv_id_str = cq.data.split(":", 1)
+            conv_id = int(conv_id_str)
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        prompt = await cq.message.answer(
+            f"↩ Ответ в диалог #{conv_id}.\nМожно текстом, фото, видео или гифкой.",
+            reply_markup=ForceReply(input_field_placeholder="Сообщение в личку..."),
+        )
+        cancel_msg = await cq.message.answer(
+            "Передумал?", reply_markup=cancel_kb(prompt.message_id)
+        )
+        await store.set_pending_pm_reply(
+            cq.message.chat.id, prompt.message_id, conv_id,
+            cancel_message_id=cancel_msg.message_id,
+        )
+        await cq.answer()
+
+    @router.callback_query(F.data.startswith("pmdice:"))
+    async def cb_pm_dice(cq: CallbackQuery) -> None:
+        """Send the literal body ``/dice`` into a conversation so the lolz
+        forum's dice game rolls server-side. The result lands as a new
+        ``conversation_message`` notification, which the notif-poller surfaces.
+        """
+        try:
+            _, conv_id_str = cq.data.split(":", 1)
+            conv_id = int(conv_id_str)
+        except (ValueError, AttributeError):
+            await cq.answer("Битые данные.", show_alert=True)
+            return
+        if not cq.message:
+            await cq.answer()
+            return
+        try:
+            await lolz.send_conversation_message(conv_id, "/dice")
+        except LolzApiError as e:
+            log.warning("pmdice failed: %s", e)
+            await cq.answer(f"Ошибка: {e}", show_alert=True)
+            return
+        await cq.answer("🎲 Отправил /dice")
+        await cq.message.answer(
+            f"🎲 Отправил <code>/dice</code> в диалог #{conv_id}. Результат придёт уведомлением.",
+            parse_mode="HTML",
+        )
+
+    @router.callback_query(F.data == "pmnew")
+    async def cb_pm_new(cq: CallbackQuery) -> None:
+        if not cq.message:
+            await cq.answer()
+            return
+        prompt = await cq.message.answer(
+            "📝 Кому отправить ЛС?\nПришли @username одним сообщением.",
+            reply_markup=ForceReply(input_field_placeholder="@username"),
+        )
+        cancel_msg = await cq.message.answer(
+            "Передумал?", reply_markup=cancel_kb(prompt.message_id)
+        )
+        await store.set_pending_pm_new_username(
+            cq.message.chat.id, prompt.message_id,
+            cancel_message_id=cancel_msg.message_id,
+        )
+        await cq.answer()
 
     @router.callback_query(F.data.startswith("transfer:"))
     async def cb_transfer(cq: CallbackQuery) -> None:
@@ -885,6 +1069,56 @@ def build_router(
                         f"✅ Сообщение отправлено на стену юзера #{target_user_id}.",
                     )
                 await _finalize_force_reply()
+            elif action == "pm_reply":
+                conv_id = int(pending.get("target_post_id") or 0)
+                if not conv_id:
+                    await message.answer("⚠ Неизвестный диалог.")
+                    return
+                await lolz.send_conversation_message(conv_id, body)
+                await message.answer(
+                    f"✓ Отправлено в диалог #{conv_id}.",
+                )
+                await _finalize_force_reply()
+            elif action == "pm_new_username":
+                username = (message.text or "").strip().lstrip("@")
+                if not username:
+                    await message.answer("⚠ Пустой username — отменено.")
+                    return
+                prompt = await message.answer(
+                    f"✍ Что написать юзеру <code>@{hd.quote(username)}</code>?",
+                    parse_mode="HTML",
+                    reply_markup=ForceReply(input_field_placeholder="Сообщение..."),
+                )
+                cancel_msg = await message.answer(
+                    "Передумал?", reply_markup=cancel_kb(prompt.message_id)
+                )
+                await store.set_pending_pm_new_body(
+                    message.chat.id, prompt.message_id, username,
+                    cancel_message_id=cancel_msg.message_id,
+                )
+                if cancel_msg_id:
+                    await _safe_delete(bot, message.chat.id, int(cancel_msg_id))
+                await _safe_delete(bot, message.chat.id, message.reply_to_message.message_id)
+                return
+            elif action == "pm_new_body":
+                username = pending.get("payload") or ""
+                if not username:
+                    await message.answer("⚠ Неизвестный получатель.")
+                    return
+                conv_id = await lolz.create_conversation_with_username(username, body)
+                if conv_id:
+                    await message.answer(
+                        f"✓ Новый диалог с <code>@{hd.quote(username)}</code> — "
+                        f"https://lolz.live/conversations/{conv_id}/",
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    await message.answer(
+                        f"✓ Сообщение отправлено юзеру <code>@{hd.quote(username)}</code>.",
+                        parse_mode="HTML",
+                    )
+                await _finalize_force_reply()
         except LolzApiError as e:
             log.exception("Force-reply action failed: %s", e)
             await message.answer(f"⚠ Ошибка lolz API: {e}")
@@ -1129,12 +1363,16 @@ def _help_text() -> str:
         "  /offtop_off — приостановить",
         "  /new_thread — создать тему (запросит заголовок)",
         "",
+        "<b>Личные сообщения и игры</b>",
+        "  /pm — открыть диалоги, ответить, начать новый",
+        "  /dice — кинуть дайс (выпадет 1–6)",
+        "",
         "<b>Уведомления и финансы</b>",
         "  /notifs_on, /notifs_off — вкл/выкл уведомлений с форума",
         "  /transfer — перевести деньги юзеру (требует LOLZ_SECRET_ANSWER, покажет баланс)",
         "",
         "<b>Кнопки</b>",
-        "  ▶/⏹ Оффтопить · 💰 Перевести · 📝 Новая тема · 🔔/🔕 Уведомления · ❓ Команды",
+        "  ▶/⏹ Оффтопить · 💬 Личка · 💰 Перевести · 📝 Новая тема · 🔔/🔕 Уведомления · ❓ Команды",
         "",
         "<b>На профиле юзера</b>",
         "  💰 Перевести деньги · ✍ Написать на стене",
@@ -1142,6 +1380,74 @@ def _help_text() -> str:
         "При нажатии «Перевести деньги» бот сразу покажет текущий баланс в окне ввода.",
     ]
     return "\n".join(lines)
+
+
+def _summarize_conversations(data: dict) -> tuple[list[tuple[int, str]], bool]:
+    """Pluck ``(id, label)`` rows out of a ``GET /conversations`` payload.
+
+    The label is ``✉ / ✉️`` (read state) + a trimmed conversation title.
+    Returns the list and a ``has_more`` hint based on the page size.
+    """
+    convs = list(data.get("conversations") or [])
+    items: list[tuple[int, str]] = []
+    for c in convs:
+        try:
+            cid = int(c.get("conversation_id", 0) or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        if not cid:
+            continue
+        title = (
+            str(c.get("conversation_title") or c.get("title") or "").strip()
+            or f"Диалог #{cid}"
+        )
+        unread = bool(
+            c.get("conversation_has_unread")
+            or c.get("conversation_is_unread")
+            or c.get("is_unread")
+        )
+        prefix = "✉️ " if unread else "✉ "
+        items.append((cid, prefix + title))
+    has_more = len(convs) >= 10
+    return items, has_more
+
+
+def _format_pm_messages(
+    title: str,
+    conversation_id: int,
+    messages: list[dict],
+) -> str:
+    """Render the recent messages of a conversation into a single HTML blob.
+
+    Newest message first. Each message shows the sender's username, a short
+    relative timestamp and the plain-text body (truncated at ~400 chars).
+    """
+    head = (
+        f"📬 <b>{hd.quote(title)}</b>  "
+        f"<i>(#{conversation_id})</i>"
+    )
+    if not messages:
+        return head + "\n\n<i>Нет сообщений на этой странице.</i>"
+    blocks: list[str] = [head, ""]
+    for m in messages:
+        author = str(m.get("message_user_username") or m.get("creator_username") or "?")
+        body = str(
+            m.get("message_body_plain_text")
+            or m.get("message_body")
+            or ""
+        ).strip()
+        if len(body) > 400:
+            body = body[:399].rstrip() + "…"
+        ts = m.get("message_create_date") or m.get("create_date") or 0
+        try:
+            from datetime import datetime
+            stamp = datetime.fromtimestamp(int(ts), tz=UTC).strftime("%m-%d %H:%M")
+        except Exception:  # noqa: BLE001
+            stamp = ""
+        blocks.append(
+            f"— <b>{hd.quote(author)}</b> <i>{stamp}</i>\n{hd.quote(body)}"
+        )
+    return "\n".join(blocks)
 
 
 def _media_kind_label(message: Message) -> str:

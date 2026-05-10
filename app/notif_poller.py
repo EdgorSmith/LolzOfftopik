@@ -21,7 +21,12 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardMarkup
 from selectolax.parser import HTMLParser
 
-from app.bot.keyboards import comment_notif_kb, generic_notif_kb, post_notif_kb
+from app.bot.keyboards import (
+    comment_notif_kb,
+    conversation_notif_kb,
+    generic_notif_kb,
+    post_notif_kb,
+)
 from app.config import Config
 from app.db import Store
 from app.lolz import LolzClient
@@ -180,8 +185,26 @@ class NotifPoller:
                 "action": action,
             }
 
+        if ctype in {"conversation_message", "conversation"}:
+            # New private message in one of our dialogs. Extract the
+            # conversation_id (used for the Reply button), then enrich the
+            # rendered preview with the actual message body via the API.
+            conv_id = _extract_conversation_id(n)
+            body = _strip_html_to_text(n.get("notification_html") or "")
+            if conv_id:
+                full = await self._fetch_latest_conversation_message(conv_id)
+                if full:
+                    body = full
+            return {
+                "reason": "conversation_message",
+                "body": body,
+                "post_id": 0,
+                "conversation_id": conv_id,
+                "action": action,
+            }
+
         if ctype != "post":
-            # Profile-post / conversation / follow / payment / market / etc.
+            # Profile-post / follow / payment / market / etc.
             # Always render the HTML preview as text so the user actually sees
             # the content (incl. ₽ amounts).
             body = _strip_html_to_text(n.get("notification_html") or "")
@@ -214,6 +237,31 @@ class NotifPoller:
         ):
             return {"reason": "mention", "body": body_text, "post_id": post_id, "action": action}
         return None
+
+    async def _fetch_latest_conversation_message(self, conversation_id: int) -> str:
+        """Pull the most recent message body of ``conversation_id``.
+
+        Used to fill in the ``conversation_message`` preview when the
+        rendered notification_html only carries a one-liner.
+        """
+        try:
+            messages = await self._lolz.list_conversation_messages(
+                conversation_id, limit=1, order="natural_reverse"
+            )
+        except LolzApiError as e:
+            log.info("list_conversation_messages(%s) failed: %s", conversation_id, e)
+            return ""
+        if not messages:
+            return ""
+        m = messages[0]
+        body = (
+            m.get("message_body_plain_text")
+            or m.get("message_body")
+            or ""
+        )
+        if "<" in body:
+            return _strip_html_to_text(body)
+        return _strip_bbcode(body)
 
     async def _fetch_full_comment(self, post_id: int, comment_id: int) -> str:
         """Recover the real comment body via the API.
@@ -274,6 +322,10 @@ def _kb_for(n: dict, classified: dict) -> InlineKeyboardMarkup | None:
         return comment_notif_kb(post_id, creator_user_id=creator_user_id)
     if reason in {"my_thread", "quote", "mention"} and post_id:
         return post_notif_kb(post_id, creator_user_id=creator_user_id)
+    if reason == "conversation_message":
+        conv_id = int(classified.get("conversation_id") or 0)
+        if conv_id:
+            return conversation_notif_kb(conv_id, creator_user_id=creator_user_id)
 
     url = _link_for(n)
     if not url:
@@ -292,7 +344,46 @@ def _link_for(n: dict) -> str:
         return f"https://lolz.live/profile-posts/{cid}/"
     if ctype == "user" and cid:
         return f"https://lolz.live/members/{cid}/"
+    if ctype in {"conversation", "conversation_message"}:
+        conv_id = _extract_conversation_id(n)
+        if conv_id:
+            return f"https://lolz.live/conversations/{conv_id}/"
     return ""
+
+
+def _extract_conversation_id(n: dict) -> int:
+    """Pull a conversation_id out of a notification, regardless of layout.
+
+    The forum sometimes nests it under ``content`` / ``links`` and sometimes
+    inlines it as ``content_id`` (when ``content_type == 'conversation'``).
+    """
+    for key in ("conversation_id", "content_id"):
+        v = n.get(key)
+        try:
+            cid = int(v) if v is not None else 0
+        except (TypeError, ValueError):
+            cid = 0
+        if cid:
+            ctype = (n.get("content_type") or "").lower()
+            if key == "content_id" and ctype == "conversation_message":
+                # ``content_id`` here is the *message* id; we still want the
+                # conversation. Try harder.
+                continue
+            return cid
+    content = n.get("content") or {}
+    if isinstance(content, dict):
+        for key in ("conversation_id", "id"):
+            v = content.get(key)
+            try:
+                cid = int(v) if v is not None else 0
+            except (TypeError, ValueError):
+                cid = 0
+            if cid:
+                return cid
+    # Last-ditch: scrape it out of the notification_html.
+    html_blob = n.get("notification_html") or ""
+    m = re.search(r"/conversations/(\d+)/", html_blob)
+    return int(m.group(1)) if m else 0
 
 
 def _format(n: dict, classified: dict) -> str:
@@ -334,6 +425,8 @@ def _label(n: dict, classified: dict) -> tuple[str, str]:
         if action in {"reply", "quote"}:
             return "↩", "ответил на твой комментарий"
         return "💬", "ответил под постом"
+    if reason == "conversation_message":
+        return "✉", "написал в личку"
 
     # reason == "other" — non-post notifications. Try to recognise common
     # ones and surface useful info (e.g. ₽ amount).

@@ -317,6 +317,100 @@ class LolzClient:
             # Some lolz API hosts mount payments under /zelenka/payments/transfer.
             return await self._request("POST", "/zelenka/payments/transfer", data=payload)
 
+    # ----- conversations / private messages -----------------------------------
+
+    async def list_conversations(
+        self,
+        *,
+        folder: str = "all",
+        page: int = 1,
+        limit: int = 10,
+    ) -> dict:
+        """List my conversations.
+
+        ``folder`` is one of: all / unread / groups / market / market_replacements
+        / staff / giveaways / p2p. The raw response carries a ``conversations``
+        list and pagination ``links``.
+        """
+        return await self._request(
+            "GET",
+            "/conversations",
+            params={"folder": folder, "page": page, "limit": limit},
+        )
+
+    async def get_conversation(self, conversation_id: int) -> dict:
+        """Fetch a single conversation (participants, last message, …)."""
+        data = await self._request("GET", f"/conversations/{conversation_id}")
+        return data.get("conversation") or data
+
+    async def list_conversation_messages(
+        self,
+        conversation_id: int,
+        *,
+        page: int = 1,
+        limit: int = 10,
+        order: str = "natural_reverse",
+    ) -> list[dict]:
+        """Fetch messages of a conversation. Newest-first by default."""
+        data = await self._request(
+            "GET",
+            f"/conversations/{conversation_id}/messages",
+            params={"page": page, "limit": limit, "order": order},
+        )
+        return list(data.get("messages") or [])
+
+    async def send_conversation_message(
+        self,
+        conversation_id: int,
+        body: str,
+        *,
+        reply_message_id: int | None = None,
+    ) -> dict:
+        """Append a message to a conversation. Returns the raw API response."""
+        payload: dict = {"message_body": body}
+        if reply_message_id:
+            payload["reply_message_id"] = int(reply_message_id)
+        return await self._request(
+            "POST",
+            f"/conversations/{conversation_id}/messages",
+            data=payload,
+        )
+
+    async def start_conversation(self, user_id: int) -> int:
+        """Open / re-open a 1‑on‑1 conversation with ``user_id``.
+
+        Returns the ``conversation_id`` so the caller can post a message in
+        it. Used by the "💬 Личные сообщения → Новый диалог" flow.
+        """
+        data = await self._request(
+            "POST", "/conversations/start", data={"user_id": int(user_id)}
+        )
+        c = data.get("conversation") or {}
+        return int(c.get("conversation_id", 0) or data.get("conversation_id", 0) or 0)
+
+    async def create_conversation_with_username(
+        self,
+        username: str,
+        body: str,
+    ) -> int:
+        """Send the very first message in a brand-new conversation by
+        username. The forum endpoint accepts an array of recipients; we
+        always pass exactly one for the personal-PM flow.
+
+        Returns the new ``conversation_id`` (or 0 if the API didn't echo it).
+        """
+        data = await self._request(
+            "POST",
+            "/conversations",
+            data={
+                "recipients[]": username,
+                "is_group": "false",
+                "message_body": body,
+            },
+        )
+        c = data.get("conversation") or {}
+        return int(c.get("conversation_id", 0) or 0)
+
     # ----- profile posts (wall comments) --------------------------------------
 
     async def create_profile_post(self, user_id: int, body: str) -> int:

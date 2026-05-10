@@ -384,6 +384,63 @@ class Store:
             cancel_message_id=cancel_message_id,
         )
 
+    async def set_pending_pm_reply(
+        self,
+        chat_id: int,
+        prompt_message_id: int,
+        conversation_id: int,
+        cancel_message_id: int | None = None,
+    ) -> None:
+        """User must type the body of a private-message reply.
+
+        ``target_post_id`` carries the conversation_id so the consumer can
+        post into the right conversation.
+        """
+        await self._set_pending(
+            chat_id, prompt_message_id, "pm_reply",
+            target_thread_id=None,
+            target_post_id=int(conversation_id),
+            card_chat_id=chat_id,
+            card_message_id=prompt_message_id,
+            payload=None,
+            cancel_message_id=cancel_message_id,
+        )
+
+    async def set_pending_pm_new_username(
+        self,
+        chat_id: int,
+        prompt_message_id: int,
+        cancel_message_id: int | None = None,
+    ) -> None:
+        """First step of "📝 Новый диалог" — ask for the recipient @username."""
+        await self._set_pending(
+            chat_id, prompt_message_id, "pm_new_username",
+            target_thread_id=None,
+            target_post_id=None,
+            card_chat_id=chat_id,
+            card_message_id=prompt_message_id,
+            payload=None,
+            cancel_message_id=cancel_message_id,
+        )
+
+    async def set_pending_pm_new_body(
+        self,
+        chat_id: int,
+        prompt_message_id: int,
+        username: str,
+        cancel_message_id: int | None = None,
+    ) -> None:
+        """Second step of "📝 Новый диалог" — ask for the first message body."""
+        await self._set_pending(
+            chat_id, prompt_message_id, "pm_new_body",
+            target_thread_id=None,
+            target_post_id=None,
+            card_chat_id=chat_id,
+            card_message_id=prompt_message_id,
+            payload=username,
+            cancel_message_id=cancel_message_id,
+        )
+
     async def _set_pending(
         self,
         chat_id: int,
