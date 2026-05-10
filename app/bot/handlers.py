@@ -22,7 +22,6 @@ from app.bot.cards import (
     update_replied_card_text,
 )
 from app.bot.keyboards import (
-    BALANCE_BUTTON_TEXT,
     CREATE_THREAD_BUTTON_TEXT,
     HELP_BUTTON_TEXT,
     NOTIFS_TOGGLE_BUTTON_TEXTS,
@@ -107,10 +106,6 @@ def build_router(
     async def cmd_notifs_off(message: Message) -> None:
         await _set_notifications(message, False)
 
-    @router.message(Command("balance"))
-    async def cmd_balance(message: Message) -> None:
-        await _show_balance(message)
-
     @router.message(Command("transfer"))
     async def cmd_transfer(message: Message) -> None:
         await _begin_transfer_open(message)
@@ -137,9 +132,6 @@ def build_router(
             return
         if text == TRANSFER_BUTTON_TEXT:
             await _begin_transfer_open(message)
-            return
-        if text == BALANCE_BUTTON_TEXT:
-            await _show_balance(message)
             return
         if text == HELP_BUTTON_TEXT:
             await message.answer(_help_text(), parse_mode="HTML")
@@ -189,16 +181,6 @@ def build_router(
             reply_markup=await _menu(),
         )
 
-    async def _show_balance(message: Message) -> None:
-        try:
-            data = await lolz.get_balance()
-        except LolzApiError as e:
-            log.warning("get_balance failed: %s", e)
-            await message.answer(f"⚠ Не удалось получить баланс: {e}")
-            return
-        text = _format_balance(data)
-        await message.answer(text, parse_mode="HTML")
-
     async def _begin_transfer_open(message: Message) -> None:
         if not config.lolz_secret_answer:
             await message.answer(
@@ -207,7 +189,9 @@ def build_router(
                 parse_mode="HTML",
             )
             return
+        balance_line = await _build_balance_line(lolz)
         prompt = await message.answer(
+            f"{balance_line}\n"
             "💰 Кому и сколько перевести?\n"
             "Формат: <code>@username сумма [комментарий]</code>\n"
             "Например: <code>@HvHpasta 100 спасибо</code>",
@@ -350,19 +334,6 @@ def build_router(
             text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb,
         )
 
-    @router.callback_query(F.data == "balance")
-    async def cb_balance(cq: CallbackQuery) -> None:
-        if not cq.message:
-            await cq.answer()
-            return
-        await cq.answer("Проверяю…")
-        try:
-            data = await lolz.get_balance()
-        except LolzApiError as e:
-            await cq.message.answer(f"⚠ Не удалось получить баланс: {e}")
-            return
-        await cq.message.answer(_format_balance(data), parse_mode="HTML")
-
     @router.callback_query(F.data.startswith("transfer:"))
     async def cb_transfer(cq: CallbackQuery) -> None:
         try:
@@ -380,7 +351,9 @@ def build_router(
                 show_alert=True,
             )
             return
+        balance_line = await _build_balance_line(lolz)
         prompt = await cq.message.answer(
+            f"{balance_line}\n"
             f"💰 Сколько перевести юзеру #{user_id}?\n"
             "Формат: <code>сумма [комментарий]</code>\n"
             "Например: <code>100 спасибо за помощь</code>",
@@ -1015,6 +988,38 @@ def _format_profile(user: dict) -> tuple[str, str | None, str]:
     return "\n".join(lines), (avatar or None), profile_url
 
 
+_BALANCE_FIELD_NAMES = (
+    "balance",
+    "user_money",
+    "user_balance",
+    "user_balance_format",
+    "user_balance_short",
+    "money",
+    "value",
+)
+
+
+def _extract_balance_value(data: dict) -> str | None:
+    """Pull a printable balance string out of an API response.
+
+    Walks the canonical fields (``balance``, ``user_money``…) at the top
+    level and inside ``raw`` (where ``/users/me`` data lives after our
+    fallback). Returns ``None`` if nothing useful is there.
+    """
+    if not isinstance(data, dict):
+        return None
+    for source in (data, data.get("raw") if isinstance(data.get("raw"), dict) else None):
+        if not source:
+            continue
+        for key in _BALANCE_FIELD_NAMES:
+            v = source.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if isinstance(v, (int, float)):
+                return f"{float(v):.2f} ₽"
+    return None
+
+
 def _format_balance(data: dict) -> str:
     """Pretty-print whatever ``LolzClient.get_balance()`` returned.
 
@@ -1024,12 +1029,9 @@ def _format_balance(data: dict) -> str:
     """
     if not data:
         return "💼 Баланс пуст или недоступен."
-    # Most common: a single "balance" string.
-    bal = data.get("balance") or data.get("user_money") or data.get("user_balance")
-    if isinstance(bal, str) and bal.strip():
-        return f"💼 Баланс: <b>{hd.quote(bal.strip())}</b>"
-    if isinstance(bal, (int, float)):
-        return f"💼 Баланс: <b>{bal:.2f} ₽</b>"
+    bal = _extract_balance_value(data)
+    if bal is not None:
+        return f"💼 Баланс: <b>{hd.quote(bal)}</b>"
     # Some endpoints return per-currency dicts: {"rub": 100, "usd": 5}
     parts: list[str] = []
     for k, v in data.items():
@@ -1040,6 +1042,23 @@ def _format_balance(data: dict) -> str:
     if parts:
         return "💼 Баланс\n" + "\n".join(parts)
     return "💼 Баланс не определён."
+
+
+async def _build_balance_line(lolz: LolzClient) -> str:
+    """Inline balance summary for the transfer prompts.
+
+    Returns a single short line like ``💼 Баланс: <b>123.45 ₽</b>``,
+    or a fallback notice when the API didn't surface a numeric value.
+    """
+    try:
+        data = await lolz.get_balance()
+    except LolzApiError as e:
+        log.warning("get_balance failed: %s", e)
+        return "💼 Баланс: недоступен (нет права 'payment' у токена)"
+    bal = _extract_balance_value(data)
+    if bal is not None:
+        return f"💼 Баланс: <b>{hd.quote(bal)}</b>"
+    return "💼 Баланс: не определён (скорее всего у токена нет права 'payment')"
 
 
 def _parse_transfer_input(text: str) -> tuple[float, str, str] | None:
@@ -1112,14 +1131,15 @@ def _help_text() -> str:
         "",
         "<b>Уведомления и финансы</b>",
         "  /notifs_on, /notifs_off — вкл/выкл уведомлений с форума",
-        "  /balance — размер баланса кошелька",
-        "  /transfer — перевести деньги юзеру (требует LOLZ_SECRET_ANSWER)",
+        "  /transfer — перевести деньги юзеру (требует LOLZ_SECRET_ANSWER, покажет баланс)",
         "",
         "<b>Кнопки</b>",
-        "  ▶/⏹ Оффтопить · 💰 Перевести · 💼 Баланс · 📝 Новая тема · 🔔/🔕 Уведомления · ❓ Команды",
+        "  ▶/⏹ Оффтопить · 💰 Перевести · 📝 Новая тема · 🔔/🔕 Уведомления · ❓ Команды",
         "",
         "<b>На профиле юзера</b>",
-        "  💰 Перевести деньги · ✍ Написать на стене · 💼 Мой баланс",
+        "  💰 Перевести деньги · ✍ Написать на стене",
+        "",
+        "При нажатии «Перевести деньги» бот сразу покажет текущий баланс в окне ввода.",
     ]
     return "\n".join(lines)
 

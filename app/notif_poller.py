@@ -159,11 +159,17 @@ class NotifPoller:
             body, post_id, comment_id = _parse_comment_html(
                 n.get("notification_html") or "", my_username
             )
-            # If the rendered preview hides content ("[Скрытый контент]")
-            # we have authenticated access to the parent post, so we can
-            # fetch the comment list and pull the real text. Same trick
-            # works for cases where the preview was truncated to ~200 chars.
-            if post_id and (_HIDDEN_PLACEHOLDER_RE.search(body) or len(body) >= 195):
+            # Try the API recovery path whenever the rendered preview is
+            # missing/short/hidden/truncated. The bdApi response is
+            # authenticated as us, so [HIDE] blocks come back unwrapped.
+            comment_id = comment_id or int(n.get("content_id") or 0)
+            needs_recovery = (
+                not body
+                or len(body) < 3
+                or _HIDDEN_PLACEHOLDER_RE.search(body)
+                or len(body) >= 195
+            )
+            if post_id and needs_recovery:
                 full = await self._fetch_full_comment(post_id, comment_id)
                 if full:
                     body = full
@@ -398,16 +404,35 @@ def _parse_comment_html(notif_html: str, my_username: str) -> tuple[str, int, in
         cm = re.search(r"data-(?:post-)?comment-id=\"(\d+)\"", notif_html)
     comment_id = int(cm.group(1)) if cm else 0
 
-    # The comment body is the part after the first <br>.
-    parts = re.split(r"<br\s*/?>", notif_html, maxsplit=1)
-    raw_body = parts[1] if len(parts) > 1 else notif_html
-    text = HTMLParser(raw_body).text(separator="").strip()
+    # First try a structured pickup: lolz wraps the comment body in a
+    # ``<span class="...quote...">`` (or similar) sibling, which is the
+    # cleanest source. Falls back to splitting on the first <br>.
+    text = ""
+    tree = HTMLParser(notif_html)
+    quote_node = tree.css_first("span.quote, blockquote, .commentSnippet, .nsnippet")
+    if quote_node:
+        text = quote_node.text(separator=" ").strip()
+    if not text:
+        # Drop the leading <a href="/posts/.../preview"> link (header) so
+        # the remainder is the actual comment body. We keep <br> as a soft
+        # newline for legibility.
+        without_header = re.sub(
+            r'(?is)^.*?<a[^>]+href="[^"]*/posts/\d+/preview[^"]*"[^>]*>.*?</a>\s*:?',
+            "",
+            notif_html,
+        )
+        # If the regex didn't bite, fall back to splitting at the first <br>.
+        candidate = without_header if without_header != notif_html else notif_html
+        parts = re.split(r"<br\s*/?>", candidate, maxsplit=1)
+        raw_body = parts[1] if len(parts) > 1 else candidate
+        text = HTMLParser(raw_body).text(separator=" ").strip()
     text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
 
-    # Drop our own @-mention prefix ("MyNick, ...").
+    # Drop our own @-mention prefix ("MyNick, ..." or "@MyNick:").
     if my_username:
         prefix = re.match(
-            rf"^@?{re.escape(my_username)}\s*,\s*", text, re.IGNORECASE
+            rf"^@?{re.escape(my_username)}\s*[,:]\s*", text, re.IGNORECASE
         )
         if prefix:
             text = text[prefix.end():]

@@ -155,12 +155,20 @@ def render_text_for_telegram(post_body_html: str, max_len: int = 3500) -> str:
     if not post_body_html:
         return ""
     # Drop the XenForo "smart link" preview wrappers entirely — they re-render
-    # the linked thread's title/forum/timestamp as a nested block, which is
-    # noise for our card. The bare URL stays in the surrounding <a> tag.
+    # the linked thread/profile/forum's title/owner/timestamp as a nested
+    # block, which is just whitespace once we strip tags. The bare URL stays
+    # in the surrounding <a> tag.
     s = re.sub(
-        r"(?is)<div[^>]*\b(?:js-unfurl|js-thread-link|bbCodeBlock|messageAttribution)[^>]*>.*?</div>",
+        r"(?is)<div[^>]*\b(?:js-unfurl|js-thread-link|js-member-link|js-user-link|"
+        r"unfurl|memberCard|messageAttribution)[^>]*>.*?</div>",
         " ",
         post_body_html,
+    )
+    # Same trick for the <aside class="memberCard">…</aside> profile preview.
+    s = re.sub(
+        r"(?is)<aside[^>]*\b(?:memberCard|unfurl|js-member-link)[^>]*>.*?</aside>",
+        " ",
+        s,
     )
     # Replace smiley images with their shortcodes so they survive stripping.
     s = _replace_smileys_with_shortcodes(s)

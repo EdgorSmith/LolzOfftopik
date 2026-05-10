@@ -8,7 +8,6 @@ START_BUTTON_TEXT = "▶ Начать оффтопить"
 STOP_BUTTON_TEXT = "⏹ Окончить оффтоп"
 CREATE_THREAD_BUTTON_TEXT = "📝 Создать тему"
 TRANSFER_BUTTON_TEXT = "💰 Перевести деньги"
-BALANCE_BUTTON_TEXT = "💼 Мой баланс"
 NOTIFS_ON_BUTTON_TEXT = "🔔 Уведомления: вкл"
 NOTIFS_OFF_BUTTON_TEXT = "🔕 Уведомления: выкл"
 HELP_BUTTON_TEXT = "❓ Команды"
@@ -25,9 +24,8 @@ def main_menu(
 
     Layout:
       [▶ / ⏹ оффтоп]
-      [💰 Перевести]   [💼 Мой баланс]
-      [📝 Создать тему] [🔔/🔕 Уведомления]
-      [❓ Команды]
+      [💰 Перевести]   [📝 Создать тему]
+      [🔔/🔕 Уведомления] [❓ Команды]
     """
     poll_label = STOP_BUTTON_TEXT if polling_enabled else START_BUTTON_TEXT
     notif_label = NOTIFS_ON_BUTTON_TEXT if notifs_enabled else NOTIFS_OFF_BUTTON_TEXT
@@ -35,13 +33,12 @@ def main_menu(
         [KeyboardButton(text=poll_label)],
         [
             KeyboardButton(text=TRANSFER_BUTTON_TEXT),
-            KeyboardButton(text=BALANCE_BUTTON_TEXT),
+            KeyboardButton(text=CREATE_THREAD_BUTTON_TEXT),
         ],
         [
-            KeyboardButton(text=CREATE_THREAD_BUTTON_TEXT),
             KeyboardButton(text=notif_label),
+            KeyboardButton(text=HELP_BUTTON_TEXT),
         ],
-        [KeyboardButton(text=HELP_BUTTON_TEXT)],
     ]
     return ReplyKeyboardMarkup(
         keyboard=rows,
@@ -133,19 +130,16 @@ def profile_actions_kb(user_id: int, *, profile_url: str | None = None) -> Inlin
     """Action menu shown under a user's profile card.
 
     Lets the bot owner transfer money to that user, leave a profile-post on
-    their wall, check their own balance, or open the profile page on lolz.
+    their wall, or open the profile page on lolz.
     """
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(text="💰 Перевести деньги", callback_data=f"transfer:{user_id}"),
             InlineKeyboardButton(text="✍ На стене", callback_data=f"wallpost:{user_id}"),
         ],
-        [
-            InlineKeyboardButton(text="💼 Мой баланс", callback_data="balance"),
-        ],
     ]
     if profile_url:
-        rows[1].append(InlineKeyboardButton(text="🌐 Открыть", url=profile_url))
+        rows.append([InlineKeyboardButton(text="🌐 Открыть", url=profile_url)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
